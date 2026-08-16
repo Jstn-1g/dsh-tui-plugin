@@ -29,6 +29,8 @@ dsh --profile tui
 
 From there the TUI opens in raw mode: `1–8` views, `/` command palette, `@` mentions, mouse selection (copies on release), wheel + `PgUp`/`PgDn` scrolling, `/lang` for 中文.
 
+The status line shows the model route with its reasoning effort (`provider/model · high`), accumulated token usage (`↑in ↓out` plus cache traffic), and while a turn runs, its elapsed time and output rate (`12.3s 45/s`). Resuming an interrupted session clears the stuck running state and shows a "session resumed — send a message to continue" notice instead.
+
 ## Build
 
 ```sh

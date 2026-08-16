@@ -10,7 +10,7 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId, type TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { CallId } from '@deepseek-ai/dsh-llm'
 import { readdir, readFile } from 'node:fs/promises'
 import { resolve as resolvePath } from 'node:path'
@@ -95,6 +95,18 @@ interface SessionState {
   fold: TranscriptFold
   transcript: TranscriptBlock[]
   running: boolean
+  /** Whether the resumed log ends with an open turn (an interrupted session). */
+  resumedOpenTurn: boolean
+  /** Provider-reported usage accumulated for this session (last sample per step replaces). */
+  usage: TokenUsage
+  /** The `turn:step` of the newest accumulated usage sample, for same-step replacement. */
+  usageStep: string | undefined
+  /** The usage sample the totals currently include for `usageStep` (for same-step replacement). */
+  usageSample: TokenUsage | undefined
+  /** Wall-clock ms when the current turn started; undefined while idle. */
+  turnStartedAt: number | undefined
+  /** Wall-clock ms when the last turn ended; undefined until one completes. */
+  lastTurnEndedAt: number | undefined
 }
 
 /** Grace period after an input chunk before a lone ESC resolves as Escape. */
@@ -105,6 +117,125 @@ const EXIT_ARM_MS = 2000
 
 /** Event-driven repaints coalesce to at most ~12 frames per second. */
 const REPAINT_INTERVAL_MS = 83
+
+/** Zero usage accumulator (all buckets absent). */
+const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0 }
+
+/**
+ * The usage a session event reports, if any: an `assistant/chunk` usage chunk
+ * or a finalized `assistant/message` usage record.
+ * @param event - the session event.
+ * @returns the usage, or `undefined` when the event carries none.
+ */
+function usageOf(event: SessionEvent): TokenUsage | undefined {
+  if (event.type === 'assistant/chunk' && event.data.chunk.type === 'usage') {
+    return event.data.chunk.usage
+  }
+  if (event.type === 'assistant/message' && event.data.usage !== undefined) {
+    return event.data.usage
+  }
+  return undefined
+}
+
+/** The `turn:step` identity of one session event, for same-step usage replacement. */
+function eventStepOf(event: SessionEvent): string | undefined {
+  const data = event.data as { turn?: number; step?: number } | undefined
+  if (data?.turn === undefined || data?.step === undefined) return undefined
+  return `${data.turn}:${data.step}`
+}
+
+/**
+ * Whether a session's logged history ends inside an open turn (a `turn/start`
+ * whose `turn/end` never landed) — the signature of an interrupted session.
+ * @param session - the session whose log is inspected.
+ * @returns whether the newest turn is still open.
+ */
+function hasOpenTurn(session: Session | undefined): boolean {
+  if (session === undefined) return false
+  for (let index = session.events.length - 1; index >= 0; index -= 1) {
+    const event = session.events[index]
+    if (event === undefined) continue
+    if (event.type === 'turn/end') return false
+    if (event.type === 'turn/start') return true
+  }
+  return false
+}
+
+/**
+ * One status-line model label: the `provider/model` route plus the reasoning
+ * effort when one is selected (e.g. `deepseek/deepseek-v4-flash · high`).
+ * @param selection - the model selection, if any.
+ * @returns the label, or `undefined` when no selection is available.
+ */
+function modelLabel(selection: { provider: string; model: string; reasoningEffort?: string } | undefined): string | undefined {
+  if (selection === undefined) return undefined
+  const base = `${selection.provider}/${selection.model}`
+  return selection.reasoningEffort === undefined ? base : `${base} · ${selection.reasoningEffort}`
+}
+
+/** Compact token counts: `1.2k` for thousands, else the plain integer. */
+function compactTokens(count: number): string {
+  return count >= 1000 ? `${(count / 1000).toFixed(count >= 10_000 ? 0 : 1)}k` : String(count)
+}
+
+/**
+ * One status-line token summary: uncached input, output, and cache traffic,
+ * e.g. `↑1.2k ↓3.4k 缓存5.6k`. Absent when nothing has been reported yet.
+ * @param usage - the accumulated usage.
+ * @returns the label, or `undefined` when no usage has landed.
+ */
+function usageTokensLabel(usage: TokenUsage): string | undefined {
+  if (usage.inputTokens === 0 && usage.outputTokens === 0
+    && (usage.cacheReadTokens ?? 0) === 0 && (usage.cacheWriteTokens ?? 0) === 0) {
+    return undefined
+  }
+  const parts = [`↑${compactTokens(usage.inputTokens)}`, `↓${compactTokens(usage.outputTokens)}`]
+  const cache = (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+  if (cache > 0) parts.push(`${t('status.cache')}${compactTokens(cache)}`)
+  return parts.join(' ')
+}
+
+/**
+ * Fold one usage sample into the running totals, replacing the previous
+ * same-step sample (a usage chunk and the finalized message report the same
+ * step; only the last one counts).
+ * @param totals - the accumulated totals.
+ * @param previousStep - the `turn:step` of the newest accumulated sample.
+ * @param previousSample - the sample the totals currently include for `previousStep`.
+ * @param step - this sample's `turn:step`.
+ * @param usage - the new usage sample.
+ * @returns the updated totals and sample identity.
+ */
+function foldUsage(
+  totals: TokenUsage,
+  previousStep: string | undefined,
+  previousSample: TokenUsage | undefined,
+  step: string | undefined,
+  usage: TokenUsage,
+): { usage: TokenUsage; sample: TokenUsage; step: string | undefined } {
+  if (step !== undefined && step === previousStep && previousSample !== undefined) {
+    return {
+      usage: {
+        inputTokens: totals.inputTokens - previousSample.inputTokens + usage.inputTokens,
+        outputTokens: totals.outputTokens - (previousSample.outputTokens ?? 0) + (usage.outputTokens ?? 0),
+        cacheReadTokens: (totals.cacheReadTokens ?? 0) - (previousSample.cacheReadTokens ?? 0) + (usage.cacheReadTokens ?? 0),
+        cacheWriteTokens: (totals.cacheWriteTokens ?? 0) - (previousSample.cacheWriteTokens ?? 0) + (usage.cacheWriteTokens ?? 0),
+      },
+      sample: usage,
+      step,
+    }
+  }
+  return {
+    usage: {
+      inputTokens: totals.inputTokens + usage.inputTokens,
+      outputTokens: totals.outputTokens + (usage.outputTokens ?? 0),
+      cacheReadTokens: (totals.cacheReadTokens ?? 0) + (usage.cacheReadTokens ?? 0),
+      cacheWriteTokens: (totals.cacheWriteTokens ?? 0) + (usage.cacheWriteTokens ?? 0),
+    },
+    sample: usage,
+    step,
+  }
+}
 
 /** Render styled segments into cells, truncating at a cell width. */
 function segmentCells(parts: readonly { text: string; style: CellStyle }[], width: number): Cell[] {
@@ -425,10 +556,20 @@ export class TuiApp {
     state.transcript = state.fold.blocks
     if (event.type === 'turn/start') {
       state.running = true
+      state.turnStartedAt = Date.now()
       this.refreshRunning()
     } else if (event.type === 'turn/end') {
       state.running = false
+      state.turnStartedAt = undefined
+      state.lastTurnEndedAt = Date.now()
       this.refreshRunning()
+    }
+    const usage = usageOf(event)
+    if (usage !== undefined) {
+      const folded = foldUsage(state.usage, state.usageStep, state.usageSample, eventStepOf(event), usage)
+      state.usage = folded.usage
+      state.usageStep = folded.step
+      state.usageSample = folded.sample
     }
     if (session.id === this.current) this.scheduleRepaint()
   }
@@ -443,7 +584,18 @@ export class TuiApp {
     let state = this.sessions.get(id)
     if (state === undefined) {
       const fold = new TranscriptFold()
-      state = { session: undefined, fold, transcript: fold.blocks, running: false }
+      state = {
+        session: undefined,
+        fold,
+        transcript: fold.blocks,
+        running: false,
+        resumedOpenTurn: false,
+        usage: { ...ZERO_USAGE },
+        usageStep: undefined,
+        usageSample: undefined,
+        turnStartedAt: undefined,
+        lastTurnEndedAt: undefined,
+      }
       this.sessions.set(id, state)
     }
     return state
@@ -517,10 +669,14 @@ export class TuiApp {
   async currentAgent(): Promise<Agent | undefined> {
     if (this.current === undefined) return undefined
     const state = this.ensureState(this.current)
-    if (state.agent !== undefined) return state.agent
+    if (state.agent !== undefined) {
+      this.syncAgentRunning(state)
+      return state.agent
+    }
     const live = this.ctx.agents.get(this.current)
     if (live !== undefined) {
       state.agent = live
+      this.syncAgentRunning(state)
       return live
     }
     const persistence = this.ctx.get('sessionPersistence')
@@ -534,6 +690,14 @@ export class TuiApp {
           setup: (agentCtx) => { this.installSelection(agentCtx) },
         })
         state.agent = handle.agent
+        // A resumed agent is constructed idle and emits no `agent/status`
+        // transition, so the running flag would otherwise stick to the
+        // interrupted turn's `turn/start`. Sync from the live agent directly.
+        this.syncAgentRunning(state)
+        state.resumedOpenTurn = hasOpenTurn(state.session)
+        if (state.resumedOpenTurn) {
+          this.pushNotice(t('status.resumedOpenTurn'))
+        }
         return handle.agent
       }
       const handle = await this.ctx.agents.create({
@@ -543,11 +707,21 @@ export class TuiApp {
         setup: (agentCtx) => { this.installSelection(agentCtx) },
       })
       state.agent = handle.agent
+      this.syncAgentRunning(state)
       return handle.agent
     } catch (error) {
       this.ctx.logger.warn(`dsh-tui: could not open session ${String(this.current)}: ${String(error)}`)
       return undefined
     }
+  }
+
+  /** Mirror the live agent's `status` into the session state's running flag. */
+  private syncAgentRunning(state: SessionState): void {
+    const agent = state.agent
+    state.running = agent?.status === 'running'
+    state.turnStartedAt = agent?.status === 'running' ? (state.turnStartedAt ?? Date.now()) : undefined
+    this.refreshRunning()
+    this.repaint()
   }
 
   /** The current default model selection. */
@@ -878,15 +1052,15 @@ export class TuiApp {
     void this.refreshSessions()
   }
 
-  /** Refresh the header model label. */
+  /** Refresh the header model label (route plus reasoning effort when set). */
   refreshModel(): void {
     const agent = this.current === undefined ? undefined : this.ctx.agents.get(this.current)
     if (agent !== undefined) {
       const selection = this.selections.get(agent)?.current ?? agent.session.requestHeader()?.config
-      this.model = selection === undefined ? undefined : `${selection.provider}/${selection.model}`
+      this.model = selection === undefined ? undefined : modelLabel(selection)
     } else {
       const selection = this.ctx.agentDefaultModel.currentSelection()
-      this.model = `${selection.provider}/${selection.model}`
+      this.model = modelLabel(selection)
     }
     this.repaint()
   }
@@ -2308,10 +2482,24 @@ export class TuiApp {
     return segmentCells(parts, width)
   }
 
-  /** The status line: model, permission preset, plan, goal, and running state. */
+  /** The status line: model+effort, tokens, permission preset, plan, goal, running. */
   private statusRow(width: number): FrameRow {
     const parts: { text: string; style: CellStyle }[] = []
     if (this.model !== undefined) parts.push({ text: this.model, style: 'cyan' })
+    const state = this.current === undefined ? undefined : this.sessions.get(this.current)
+    if (state !== undefined) {
+      const usage = state.usage
+      const elapsed = state.turnStartedAt === undefined ? undefined : Date.now() - state.turnStartedAt
+      const tokens = usageTokensLabel(usage)
+      if (tokens !== undefined) parts.push({ text: tokens, style: 'green' })
+      if (elapsed !== undefined) {
+        const seconds = elapsed / 1000
+        const rate = usage.outputTokens === 0 || seconds <= 0
+          ? undefined
+          : `${Math.round(usage.outputTokens / seconds)}/s`
+        parts.push({ text: `${seconds.toFixed(1)}s${rate === undefined ? '' : ` ${rate}`}`, style: 'green' })
+      }
+    }
     if (this.permission !== undefined) parts.push({ text: this.permission, style: 'yellow' })
     if (this.plan) parts.push({ text: 'plan', style: 'yellow' })
     if (this.goal !== undefined) parts.push({ text: `goal: ${this.goal.phase}: ${this.goal.objective}`, style: 'magenta' })

@@ -1447,6 +1447,67 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
+  it('clears the running flag on resume even when the log ends inside a turn', async () => {
+    // A session interrupted mid-turn persists a trailing turn/start with no
+    // turn/end. Resuming constructs the agent idle without emitting an
+    // agent/status transition, so the app must sync from the live agent
+    // instead of trusting the event stream — otherwise the flag sticks.
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        // The interrupted turn: a start with no matching end, as loaded from
+        // persistence (the app folds it into its session state live).
+        handle.agent.session.append('turn/start', { turn: 4 })
+        return handle
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-2' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t') // sessions view
+    app.feed('\r') // open the cold session (resume)
+    await flush()
+    const agent = await app.currentAgent()
+    expect(agent).toBeDefined()
+    expect(frameText(app)).not.toContain('running')
+    expect(frameText(app)).toContain('interrupted')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('shows a resumed-open-turn notice only once per resume', async () => {
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        handle.agent.session.append('turn/start', { turn: 1 })
+        return handle
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-3' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r')
+    await flush()
+    // Opening again via currentAgent is idempotent: no second notice.
+    await app.currentAgent()
+    expect(frameText(app)).toContain('interrupted')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
   it('refreshes a resumed session selection when a live session exists', async () => {
     const { ctx, app } = await bench()
     app.start()
@@ -1823,6 +1884,97 @@ describe('TuiApp', () => {
     app.feed('\r') // select without an effort
     await flush()
     expect(saved).toEqual({ provider: 'p1', model: 'm1' })
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('shows the selected reasoning effort in the status line', async () => {
+    const { ctx, app } = await bench()
+    let saved: unknown
+    ctx.provide('llm', {
+      listProviders: () => [{ id: 'p1', name: 'P1' }],
+      listModels: async () => [{ id: 'm1', name: 'M1' }],
+      resolveModelInfo: async () => ({
+        provider: 'p1', id: 'm1', name: 'M1',
+        reasoning: { efforts: [{ id: 'high', name: 'High' }], defaultEffort: 'high' },
+      }),
+    } as never)
+    ;(ctx.agentDefaultModel as unknown as { saveSelection: (selection: unknown) => Promise<void> }).saveSelection = async (selection) => {
+      saved = selection
+    }
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    app.feed('/model\r')
+    await flush()
+    app.feed('\r') // select high
+    await flush()
+    expect(saved).toEqual({ provider: 'p1', model: 'm1', reasoningEffort: 'high' })
+    // The status line carries the effort suffix, not just the route.
+    expect(frameText(app)).toContain('p1/m1 · high')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('shows accumulated token usage and cache traffic in the status line', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const session = ctx.sessions.list()[0]
+    if (session === undefined) throw new Error('expected a created session')
+    ctx.emit('session/event', session, {
+      type: 'assistant/chunk', seq: 0, time: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 1500, outputTokens: 200, cacheReadTokens: 800, cacheWriteTokens: 50 } } },
+    } as never)
+    expect(frameText(app)).toContain('↑1.5k')
+    expect(frameText(app)).toContain('↓200')
+    expect(frameText(app)).toContain('cache')
+    expect(frameText(app)).toContain('850') // 800 read + 50 write
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('replaces the same-step usage sample instead of double counting', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const session = ctx.sessions.list()[0]
+    if (session === undefined) throw new Error('expected a created session')
+    // A usage chunk and the finalized message report the same turn/step; the
+    // totals must reflect only the newest sample.
+    ctx.emit('session/event', session, {
+      type: 'assistant/chunk', seq: 0, time: 1,
+      data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 100, outputTokens: 10 } } },
+    } as never)
+    ctx.emit('session/event', session, {
+      type: 'assistant/message', seq: 1, time: 2,
+      data: { turn: 1, step: 1, message: { role: 'assistant', content: [] }, usage: { inputTokens: 300, outputTokens: 40 } },
+    } as never)
+    expect(frameText(app)).toContain('↑300')
+    expect(frameText(app)).toContain('↓40')
+    expect(frameText(app)).not.toContain('↑400')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('shows the turn elapsed time and token rate while running', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const session = ctx.sessions.list()[0]
+    if (session === undefined) throw new Error('expected a created session')
+    ctx.emit('session/event', session, { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } } as never)
+    ctx.emit('session/event', session, {
+      type: 'assistant/chunk', seq: 1, time: 2,
+      data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 0, outputTokens: 200 } } },
+    } as never)
+    // 200 output tokens / 1s elapsed = 200/s (the turn started right before).
+    expect(frameText(app)).toContain('running')
+    expect(frameText(app)).toMatch(/\d+\.\d+s/)
+    expect(frameText(app)).toMatch(/\d+\/s/)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
