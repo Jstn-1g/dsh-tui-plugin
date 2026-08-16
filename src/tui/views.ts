@@ -499,7 +499,9 @@ function splitContextUnits(text: string): string[] {
 
 /**
  * The sidebar: one row per session, the current session highlighted in
- * reverse video with a `›` marker and a running indicator.
+ * reverse video with a `›` marker, a running indicator, and a heavy-context
+ * marker (◆) when the session's prompt-side usage reaches the compaction
+ * threshold.
  * @param sessions - the session rows.
  * @param current - the selected session id.
  * @param width - the available sidebar width.
@@ -511,11 +513,13 @@ export function renderSidebar(sessions: readonly SessionSummary[], current: stri
   for (const session of sessions) {
     const selected = session.id === current
     const style: CellStyle = selected ? 'reverse' : ''
-    const title = truncate(session.title, Math.max(1, width - 4))
+    const title = truncate(session.title, Math.max(1, width - 6))
     const cells: Cell[] = [
       { char: selected ? '›' : ' ', style },
       { char: ' ', style },
       { char: session.running ? '●' : ' ', style: session.running ? 'green' : '' },
+      { char: ' ', style },
+      { char: session.heavy === true ? '◆' : ' ', style: session.heavy === true ? 'yellow' : '' },
       { char: ' ', style },
     ]
     for (const char of Array.from(title)) cells.push({ char, style })

@@ -15,6 +15,8 @@ export interface SessionSummary {
   cwd?: string
   /** Whether an agent is attached in this process. */
   live: boolean
+  /** Whether the session's prompt-side usage reaches the heavy-compaction threshold. */
+  heavy?: boolean
 }
 
 /**

@@ -118,8 +118,28 @@ const EXIT_ARM_MS = 2000
 /** Event-driven repaints coalesce to at most ~12 frames per second. */
 const REPAINT_INTERVAL_MS = 83
 
+/**
+ * A session whose accumulated prompt-side usage (uncached input plus cache
+ * traffic) reaches this many tokens is "heavy": resuming it without
+ * compaction repeats a large prompt on every request, which misses provider
+ * prompt caches and bills the full uncached input each time. The TUI prompts
+ * for `/compact` at this threshold.
+ */
+const HEAVY_SESSION_TOKENS = 40_000
+
 /** Zero usage accumulator (all buckets absent). */
 const ZERO_USAGE: TokenUsage = { inputTokens: 0, outputTokens: 0 }
+
+/**
+ * Prompt-side weight of one session's accumulated usage: uncached input plus
+ * cache reads and writes. This is what a resumed request re-sends, so it is
+ * the number compaction shrinks.
+ * @param usage - the accumulated usage.
+ * @returns the prompt-side token weight.
+ */
+function sessionWeight(usage: TokenUsage): number {
+  return usage.inputTokens + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+}
 
 /**
  * The usage a session event reports, if any: an `assistant/chunk` usage chunk
@@ -532,7 +552,19 @@ export class TuiApp {
     const state = this.ensureState(session.id)
     state.session = session
     state.fold = new TranscriptFold()
-    for (const event of session.events) state.fold.apply(event)
+    state.usage = { ...ZERO_USAGE }
+    state.usageStep = undefined
+    state.usageSample = undefined
+    for (const event of session.events) {
+      state.fold.apply(event)
+      const usage = usageOf(event)
+      if (usage !== undefined) {
+        const folded = foldUsage(state.usage, state.usageStep, state.usageSample, eventStepOf(event), usage)
+        state.usage = folded.usage
+        state.usageStep = folded.step
+        state.usageSample = folded.sample
+      }
+    }
     state.transcript = state.fold.blocks
     void this.refreshSessions()
     this.repaint()
@@ -693,11 +725,15 @@ export class TuiApp {
         // A resumed agent is constructed idle and emits no `agent/status`
         // transition, so the running flag would otherwise stick to the
         // interrupted turn's `turn/start`. Sync from the live agent directly.
+        this.attachResumedSession(state, handle.agent.session)
         this.syncAgentRunning(state)
         state.resumedOpenTurn = hasOpenTurn(state.session)
         if (state.resumedOpenTurn) {
           this.pushNotice(t('status.resumedOpenTurn'))
         }
+        // A heavy resumed session repeats a large prompt on every request,
+        // missing provider caches; offer compaction before the user continues.
+        this.offerCompactionIfHeavy(state)
         return handle.agent
       }
       const handle = await this.ctx.agents.create({
@@ -722,6 +758,83 @@ export class TuiApp {
     state.turnStartedAt = agent?.status === 'running' ? (state.turnStartedAt ?? Date.now()) : undefined
     this.refreshRunning()
     this.repaint()
+  }
+
+  /**
+   * Attach a resumed agent's session to the tracked state and fold its full
+   * history (transcript and token usage). A resume reuses a persisted session
+   * that may predate this app instance, so no `session/created` event fires
+   * for it here — the state must fold the log directly.
+   * @param state - the session's live state.
+   * @param session - the resumed agent's session.
+   */
+  private attachResumedSession(state: SessionState, session: Session): void {
+    if (state.session === session) return
+    state.session = session
+    state.fold = new TranscriptFold()
+    state.usage = { ...ZERO_USAGE }
+    state.usageStep = undefined
+    state.usageSample = undefined
+    for (const event of session.events) {
+      state.fold.apply(event)
+      const usage = usageOf(event)
+      if (usage !== undefined) {
+        const folded = foldUsage(state.usage, state.usageStep, state.usageSample, eventStepOf(event), usage)
+        state.usage = folded.usage
+        state.usageStep = folded.step
+        state.usageSample = folded.sample
+      }
+    }
+    state.transcript = state.fold.blocks
+    this.repaint()
+  }
+
+  /**
+   * When a resumed session's prompt-side usage reaches the heavy threshold,
+   * ask the user whether to compact it before continuing. A confirm popup
+   * defers to the ordinary key dispatch: `y` runs `/compact` through the
+   * command registry, `n`/`Esc` dismisses and the session continues as-is.
+   * @param state - the resumed session's live state.
+   */
+  private offerCompactionIfHeavy(state: SessionState): void {
+    const weight = sessionWeight(state.usage)
+    if (weight < HEAVY_SESSION_TOKENS) return
+    this.popup = {
+      kind: 'confirm',
+      prompt: t('compact.offerHeavy', {
+        tokens: compactTokens(weight),
+      }),
+      resolve: (yes) => {
+        this.popup = undefined
+        if (yes === true) void this.compactCurrent()
+        this.repaint()
+      },
+    }
+    this.repaint()
+  }
+
+  /** Run `/compact` on the current session through the command registry. */
+  private async compactCurrent(): Promise<void> {
+    const agent = await this.currentAgent()
+    const commands = this.ctx.get('commands')
+    if (agent === undefined || commands === undefined) {
+      this.pushNotice(t('compact.unavailable'))
+      return
+    }
+    const controller = new AbortController()
+    try {
+      const execution = await commands.execute(agent, '/compact', controller.signal)
+      if (execution === undefined) {
+        this.pushNotice(t('compact.unavailable'))
+        return
+      }
+      const outcome = execution.result
+      this.pushNotice(outcome.kind === 'success'
+        ? t('compact.done', { text: outcome.text ?? '' })
+        : t('compact.failed', { text: outcome.text }))
+    } catch (error: unknown) {
+      this.pushNotice(t('compact.failed', { text: String(error) }))
+    }
   }
 
   /** The current default model selection. */
@@ -2464,6 +2577,7 @@ export class TuiApp {
         running: state.running,
         ...session?.header.cwd === undefined ? {} : { cwd: session.header.cwd },
         live: session !== undefined,
+        ...sessionWeight(state.usage) >= HEAVY_SESSION_TOKENS ? { heavy: true } : {},
       })
     }
     rows.sort((left, right) => left.id < right.id ? -1 : 1)

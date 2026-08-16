@@ -326,6 +326,16 @@ describe('renderSidebar', () => {
     expect(rowText(rows[1]!)).toContain('second')
   })
 
+  it('marks a heavy session with the compaction indicator', () => {
+    const heavy: SessionSummary[] = [
+      { id: 's1' as never, title: 'first', running: false, live: true, heavy: true },
+      { id: 's2' as never, title: 'second', running: false, live: true },
+    ]
+    const rows = renderSidebar(heavy, undefined, 20)
+    expect(rowText(rows[0]!)).toContain('◆')
+    expect(rowText(rows[1]!)).not.toContain('◆')
+  })
+
   it('returns no rows for a non-positive width', () => {
     expect(renderSidebar(sessions, undefined, 0)).toEqual([])
   })

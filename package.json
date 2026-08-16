@@ -1,7 +1,7 @@
 {
   "name": "dsh-tui-plugin",
   "description": "A standalone terminal UI bundle for the DeepSeek Harness: an interactive in-process host surface over the official dsh base with session list, streaming conversation, tool cards, approvals, questions, jobs, subagents, goals, plan mode, model selection, settings, skills, and feedback. Loads as a bundle patch on top of the official @deepseek-ai/dsh CLI.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publishConfig": {
     "access": "public"
   },

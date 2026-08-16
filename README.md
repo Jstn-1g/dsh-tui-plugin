@@ -31,6 +31,11 @@ From there the TUI opens in raw mode: `1–8` views, `/` command palette, `@` me
 
 The status line shows the model route with its reasoning effort (`provider/model · high`), accumulated token usage (`↑in ↓out` plus cache traffic), and while a turn runs, its elapsed time and output rate (`12.3s 45/s`). Resuming an interrupted session clears the stuck running state and shows a "session resumed — send a message to continue" notice instead.
 
+### Session lifecycle & compaction
+
+- The sessions view marks heavy sessions (large accumulated prompt-side context, `◆`) so you can spot the expensive ones at a glance.
+- Resuming a heavy session (≥ 40k prompt tokens) offers `/compact` first: continuing would re-send the whole context on every request, missing provider prompt caches and billing full uncached input each time. Press `y` to compact, `n`/`Esc` to continue as-is. `/compact` is also always available from the command palette.
+
 ## Build
 
 ```sh

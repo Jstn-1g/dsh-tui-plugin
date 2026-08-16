@@ -1508,6 +1508,113 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
+  it('offers compaction when a resumed session is heavy and compacts on y', async () => {
+    const executed: string[] = []
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        // A heavy history: 50k prompt-side tokens from a past request.
+        handle.agent.session.append('assistant/chunk', {
+          turn: 1, step: 1,
+          chunk: { type: 'usage', usage: { inputTokens: 50_000, outputTokens: 1000 } },
+        } as never)
+        return handle
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-4' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    ctx.provide('commands', {
+      list: () => [],
+      execute: async (_agent: never, line: string) => {
+        executed.push(line)
+        return { commandId: 'c1', result: { kind: 'success', text: 'Compacted 120 history items (~45k tokens).' } }
+      },
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r') // resume the heavy session
+    await flush()
+    await app.currentAgent()
+    // The compaction offer popup renders (its leading text survives truncation).
+    expect(frameText(app)).toContain('Large context')
+    app.feed('y') // confirm compaction
+    await flush()
+    expect(executed).toEqual(['/compact'])
+    expect(frameText(app)).toContain('Compacted 120')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('dismissing the compaction offer keeps the session as-is', async () => {
+    const executed: string[] = []
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        handle.agent.session.append('assistant/chunk', {
+          turn: 1, step: 1,
+          chunk: { type: 'usage', usage: { inputTokens: 50_000, outputTokens: 1000 } },
+        } as never)
+        return handle
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-5' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    ctx.provide('commands', {
+      list: () => [],
+      execute: async (_agent: never, line: string) => {
+        executed.push(line)
+        return { commandId: 'c1', result: { kind: 'success', text: 'ok' } }
+      },
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r')
+    await flush()
+    await app.currentAgent()
+    expect(frameText(app)).toContain('Large context')
+    app.feed('n') // decline
+    await flush()
+    expect(executed).toEqual([])
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('does not offer compaction for a light resumed session', async () => {
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        return handle
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-6' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r')
+    await flush()
+    expect(frameText(app)).not.toContain('compact')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
   it('refreshes a resumed session selection when a live session exists', async () => {
     const { ctx, app } = await bench()
     app.start()
@@ -1971,7 +2078,10 @@ describe('TuiApp', () => {
       type: 'assistant/chunk', seq: 1, time: 2,
       data: { turn: 1, step: 1, chunk: { type: 'usage', usage: { inputTokens: 0, outputTokens: 200 } } },
     } as never)
-    // 200 output tokens / 1s elapsed = 200/s (the turn started right before).
+    // Let real time elapse so the elapsed seconds and rate render (a zero
+    // elapsed turn suppresses the rate).
+    await new Promise(resolve => setTimeout(resolve, 20))
+    // 200 output tokens / >0s elapsed = a positive rate.
     expect(frameText(app)).toContain('running')
     expect(frameText(app)).toMatch(/\d+\.\d+s/)
     expect(frameText(app)).toMatch(/\d+\/s/)
