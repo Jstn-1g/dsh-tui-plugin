@@ -11,14 +11,23 @@ It is a standard Cordis **bundle plugin** (`cordis.patch.yml` + `tui-runner`/`tu
 
 ## Install & run
 
+This is a **bundle plugin** for the official `dsh` CLI: install it into a profile's bundle stack, then boot that profile. It layers the terminal runner over the official `dsh-base` bundle.
+
 ```sh
 npm i -g @deepseek-ai/dsh
 npm i -g dsh-tui-plugin
 
-dsh --patch dsh-tui-plugin     # boots base + this tui patch
+# one-time: create/use a profile and add this bundle to it
+dsh plugin --profile tui add dsh-tui-plugin
+# (the first `add` creates the `tui` profile; it also installs dsh-base)
+
+# every launch: boot the profile
+dsh --profile tui
 ```
 
-The patch layers the terminal runner over the official base. From there the TUI opens in raw mode: `1–8` views, `/` command palette, `@` mentions, mouse selection (copies on release), wheel + `PgUp`/`PgDn` scrolling, `/lang` for 中文.
+> `dsh --patch <path>` takes a patch *file path*, not a package name. Bundle plugins are loaded by listing the package name in the profile's `dsh.profile.bundles` (which `dsh plugin --profile tui add dsh-tui-plugin` does for you) and installing it with pnpm in the profile directory.
+
+From there the TUI opens in raw mode: `1–8` views, `/` command palette, `@` mentions, mouse selection (copies on release), wheel + `PgUp`/`PgDn` scrolling, `/lang` for 中文.
 
 ## Build
 
