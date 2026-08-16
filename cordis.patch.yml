@@ -1,0 +1,50 @@
+# The dsh-tui bundle patch: the interactive terminal surface over dsh-base.
+# Applied after dsh-base's insert; rows here override base rows by id, with
+# the profile's own cordis.patch.yml and any --patch overlays still to come.
+#
+# A patch replaces the targeted row's whole `config`, so each row below
+# restates every key it owns.
+#
+# The tui-startup plugin injects `cmdlineArgs` and provides `tuiStartup` as an
+# ordinary Cordis service. Rows configured from flags inject that service, so
+# Loader resolves their expressions only after it exists. The tui-runner row
+# then reads the resolved startup values.
+
+# ── surface-specific values the base deliberately omits ─────────────────────
+
+- id: system-prompt
+  config:
+    persona: >-
+      You are a coding agent powered by the {{model}} model. Your working directory is {{cwd}}.
+
+# The shared module-reload HMR row stays off; the launcher's watch-only
+# fallback still keeps the user patch layers live while the TUI runs.
+- id: hmr
+  disabled: true
+
+- id: tools
+  config:
+    # Keep the same temporary process-wide Code Mode opt-in as the Web surface.
+    mode: !!js process.env.DSH_TOOLS_MODE
+
+# ── terminal-only host rows ─────────────────────────────────────────────────
+#
+# The `name` entries below reference THIS package's own name (it exports
+# `./startup` and its main entry). If you ever rename the package in
+# package.json, update the two `dsh-tui-plugin` names here to match.
+
+- insert:
+    - id: code-runtime
+      name: '@deepseek-ai/dsh-code-runtime-worker-thread'
+
+    - id: tui-startup
+      name: 'dsh-tui-plugin/startup'
+
+    # The TUI runner: an interactive in-process host surface. It reads its
+    # flags from the ordinary tuiStartup provider and drives the terminal
+    # directly from host services.
+    - id: tui-runner
+      name: 'dsh-tui-plugin'
+      inject: [tuiStartup]
+      config:
+        startup: !!js ctx.tuiStartup
