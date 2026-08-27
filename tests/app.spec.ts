@@ -1783,6 +1783,76 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
+  it('resumes the startup session and renders its transcript on boot', async () => {
+    const resumed: string[] = []
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumed.push(options.resumeSessionId)
+        const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+        handle.agent.session.append('assistant/message', {
+          turn: 1,
+          step: 1,
+          message: createAssistantMessage({
+            content: [{ type: 'text', text: 'persisted answer' }],
+            source: { provider: 'p', model: 'm' },
+          }),
+        }, { surfaceOp: 'append' })
+        return handle
+      },
+    }, { resume: 'cold-startup' as never, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-startup' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    expect(resumed).toEqual(['cold-startup'])
+    expect(frameText(app)).toContain('persisted answer')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('single-flights startup resume when the first message arrives during hydration', async () => {
+    const resumed: string[] = []
+    const seen: UserMessage[] = []
+    let announceResume!: () => void
+    let releaseResume!: () => void
+    const resumeStarted = new Promise<void>(resolve => { announceResume = resolve })
+    const resumeGate = new Promise<void>(resolve => { releaseResume = resolve })
+    const { ctx, app } = await bench({
+      afterPrompt: async (_session, message) => { seen.push(message) },
+      resume: async (ownerCtx, options) => {
+        resumed.push(options.resumeSessionId)
+        announceResume()
+        await resumeGate
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+          afterPrompt: async (_session, message) => { seen.push(message) },
+        })
+      },
+    }, { resume: 'cold-startup' as never, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: 'cold-startup' as never, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await resumeStarted
+    const sending = app.send('first message')
+    await Promise.resolve()
+    expect(resumed).toEqual(['cold-startup'])
+    releaseResume()
+    await sending
+    await flush()
+    expect(resumed).toEqual(['cold-startup'])
+    expect(seen).toHaveLength(1)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
   it('creates a fresh agent when the resume id is unknown to persistence', async () => {
     const { ctx, app } = await bench({}, { resume: 'resume-me' as never, plan: false })
     ctx.provide('sessionPersistence', {

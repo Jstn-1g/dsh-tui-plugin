@@ -91,6 +91,8 @@ export type TuiView =
 interface SessionState {
   session: Session | undefined
   agent?: Agent
+  /** The one in-flight create/resume for this session, shared by concurrent callers. */
+  openingAgent?: Promise<Agent | undefined>
   /** Incremental transcript fold; keeps streaming chunks O(1). */
   fold: TranscriptFold
   transcript: TranscriptBlock[]
@@ -651,7 +653,7 @@ export class TuiApp {
     return this.sessions.keys().next().value
   }
 
-  /** List live + persisted sessions and track them; only `--resume` selects one. */
+  /** List live + persisted sessions and track them; only `--resume` opens one. */
   async refreshSessions(): Promise<void> {
     const live = this.ctx.sessions.list().map((session) => {
       const state = this.sessions.get(session.id)
@@ -688,6 +690,7 @@ export class TuiApp {
     // The app starts empty: only an explicit `--resume` opens a session.
     if (this.current === undefined && this.startup.resume !== undefined) {
       this.ensureCurrent(this.startup.resume)
+      await this.currentAgent()
     }
     this.repaint()
   }
@@ -699,25 +702,38 @@ export class TuiApp {
    * @returns the live agent, or `undefined` when no session is current or creation failed.
    */
   async currentAgent(): Promise<Agent | undefined> {
-    if (this.current === undefined) return undefined
-    const state = this.ensureState(this.current)
+    const id = this.current
+    if (id === undefined) return undefined
+    const state = this.ensureState(id)
     if (state.agent !== undefined) {
       this.syncAgentRunning(state)
       return state.agent
     }
-    const live = this.ctx.agents.get(this.current)
+    const live = this.ctx.agents.get(id)
     if (live !== undefined) {
       state.agent = live
       this.syncAgentRunning(state)
       return live
     }
+    if (state.openingAgent !== undefined) return state.openingAgent
+    const opening = this.openAgent(id, state)
+    state.openingAgent = opening
+    try {
+      return await opening
+    } finally {
+      if (state.openingAgent === opening) state.openingAgent = undefined
+    }
+  }
+
+  /** Create or resume one captured session id; callers single-flight this through its state. */
+  private async openAgent(id: SessionId, state: SessionState): Promise<Agent | undefined> {
     const persistence = this.ctx.get('sessionPersistence')
     const headers = persistence === undefined ? [] : await persistence.list()
-    const stored = headers.find(header => header.id === this.current)
+    const stored = headers.find(header => header.id === id)
     try {
       if (stored !== undefined) {
         const handle = await this.ctx.agents.resume({
-          resumeSessionId: this.current,
+          resumeSessionId: id,
           agentOptions: this.agentOptions(),
           setup: (agentCtx) => { this.installSelection(agentCtx) },
         })
@@ -737,7 +753,7 @@ export class TuiApp {
         return handle.agent
       }
       const handle = await this.ctx.agents.create({
-        sessionId: this.current,
+        sessionId: id,
         agentOptions: this.agentOptions(),
         meta: { cwd: process.cwd() },
         setup: (agentCtx) => { this.installSelection(agentCtx) },
@@ -746,7 +762,7 @@ export class TuiApp {
       this.syncAgentRunning(state)
       return handle.agent
     } catch (error) {
-      this.ctx.logger.warn(`dsh-tui: could not open session ${String(this.current)}: ${String(error)}`)
+      this.ctx.logger.warn(`dsh-tui: could not open session ${String(id)}: ${String(error)}`)
       return undefined
     }
   }
