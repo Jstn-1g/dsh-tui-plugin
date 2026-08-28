@@ -823,7 +823,7 @@ export class TuiApp {
     }
     const controller = new AbortController()
     try {
-      const execution = await commands.execute(agent, '/compact', controller.signal)
+      const execution = await commands.execute(agent, '/compact', [], controller.signal)
       if (execution === undefined) {
         this.pushNotice(t('compact.unavailable'))
         return
@@ -931,7 +931,7 @@ export class TuiApp {
       if (commands === undefined) return
       const controller = new AbortController()
       try {
-        const execution = await commands.execute(agent, line, controller.signal)
+        const execution = await commands.execute(agent, line, [], controller.signal)
         if (execution === undefined) this.pushNotice(t('command.unknown', { line }))
       } catch (error: unknown) {
         this.pushNotice(t('command.failed', { error: String(error) }))

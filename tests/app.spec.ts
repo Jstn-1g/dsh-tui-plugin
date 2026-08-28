@@ -1509,7 +1509,7 @@ describe('TuiApp', () => {
   })
 
   it('offers compaction when a resumed session is heavy and compacts on y', async () => {
-    const executed: string[] = []
+    const calls: unknown[][] = []
     const { ctx, app } = await bench({
       resume: async (ownerCtx, options) => {
         const handle = await makeHandle(ctx, ownerCtx, options.resumeSessionId, {
@@ -1530,8 +1530,8 @@ describe('TuiApp', () => {
     } as never)
     ctx.provide('commands', {
       list: () => [],
-      execute: async (_agent: never, line: string) => {
-        executed.push(line)
+      execute: async (...args: unknown[]) => {
+        calls.push(args)
         return { commandId: 'c1', result: { kind: 'success', text: 'Compacted 120 history items (~45k tokens).' } }
       },
     } as never)
@@ -1540,12 +1540,17 @@ describe('TuiApp', () => {
     app.feed('\t')
     app.feed('\r') // resume the heavy session
     await flush()
-    await app.currentAgent()
+    const agent = await app.currentAgent()
     // The compaction offer popup renders (its leading text survives truncation).
     expect(frameText(app)).toContain('Large context')
     app.feed('y') // confirm compaction
     await flush()
-    expect(executed).toEqual(['/compact'])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![0]).toBe(agent)
+    expect(calls[0]![1]).toBe('/compact')
+    expect(calls[0]![2]).toEqual([])
+    expect(calls[0]![3]).toBeInstanceOf(AbortSignal)
+    expect((calls[0]![3] as AbortSignal).aborted).toBe(false)
     expect(frameText(app)).toContain('Compacted 120')
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
@@ -2172,20 +2177,26 @@ describe('TuiApp', () => {
   })
 
   it('sends a slash command directly', async () => {
-    const executed: string[] = []
+    const calls: unknown[][] = []
     const { ctx, app } = await bench()
     ctx.provide('commands', {
       list: () => [],
-      execute: async (_agent: never, line: string) => {
-        executed.push(line)
+      execute: async (...args: unknown[]) => {
+        calls.push(args)
         return { commandId: 'x', result: { kind: 'success', text: 'ok' } }
       },
     } as never)
     app.start()
     app.feed('\x0e')
     await flush()
+    const agent = await app.currentAgent()
     await app.send('/compact')
-    expect(executed).toEqual(['/compact'])
+    expect(calls).toHaveLength(1)
+    expect(calls[0]![0]).toBe(agent)
+    expect(calls[0]![1]).toBe('/compact')
+    expect(calls[0]![2]).toEqual([])
+    expect(calls[0]![3]).toBeInstanceOf(AbortSignal)
+    expect((calls[0]![3] as AbortSignal).aborted).toBe(false)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })

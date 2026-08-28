@@ -7,7 +7,7 @@ It is a standard Cordis **bundle plugin** (`cordis.patch.yml` + `tui-runner`/`tu
 ## Requirements
 
 - Node `^22.19` or `>=24`
-- The official [DeepSeek Harness CLI](https://www.npmjs.com/package/@deepseek-ai/dsh) installed, so the `dsh-base` bundle and the cmdline/exit services exist.
+- The official [DeepSeek Harness CLI](https://www.npmjs.com/package/@deepseek-ai/dsh) installed with the `0.1.1-rc.2` package set or a compatible newer release, so the `dsh-base` bundle and the cmdline/exit services exist.
 
 ## Install & run
 
