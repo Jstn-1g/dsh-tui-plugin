@@ -11,10 +11,10 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import { createUserMessage, ReasoningEffortId, type TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { CallId } from '@deepseek-ai/dsh-llm'
+import { randomUUID } from 'node:crypto'
 import { readdir, readFile } from 'node:fs/promises'
 import { resolve as resolvePath } from 'node:path'
-import type { Agent, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentOptions, ModelSelection, ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
 import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import { SessionId as brandSessionId } from '@deepseek-ai/dsh-session'
@@ -22,9 +22,9 @@ import { SessionId as brandSessionId } from '@deepseek-ai/dsh-session'
 // `commands`, `planMode`, `userQuestions`, `approval`) and the approval event
 // vocabulary, without value dependencies on their seams.
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import type {} from '@deepseek-ai/dsh-commands'
+import type { CommandExecution } from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-plan-mode'
-import type {} from '@deepseek-ai/dsh-user-questions'
+import type { AskUserQuestionAnswer, AskUserQuestionRequest } from '@deepseek-ai/dsh-user-questions'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-session-title'
@@ -40,11 +40,11 @@ import type { TuiIo } from './screen.ts'
 import { TuiScreen } from './screen.ts'
 import type { Frame, FrameRow, Cell } from './screen.ts'
 import type { CellStyle } from './screen.ts'
-import { TranscriptFold, type TranscriptBlock } from './fold.ts'
+import { TranscriptFold, type ToolCallKey, type TranscriptBlock } from './fold.ts'
 import type { TranscriptRowCache } from './fold.ts'
 import type { SessionSummary } from './summary.ts'
 import { foldTitle, mergeSummaries, shortId, summarizeLive } from './summary.ts'
-import type { TuiPopup } from './popups.ts'
+import type { QuestionPopup, TuiPopup } from './popups.ts'
 import { clampCursor, modePopup, modelPopup, renderApprovalPopup, renderCommandPalette, renderConfirmPopup, renderListPopup, renderMentionPopup, renderQuestionPopup, visibleItems } from './popups.ts'
 import type { MentionCandidate, ModelPickItem } from './popups.ts'
 import {
@@ -76,6 +76,41 @@ import { charWidth } from './width.ts'
 import { buildModelGroups, type ModelProviderGroup } from './model-catalog.ts'
 import type { TuiStartupValues } from '../startup.ts'
 
+/** The provider API used before the alpha scoped-answerer migration. */
+interface LegacyUserQuestionService {
+  registerProvider?: (provider: {
+    ask(request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer>
+  }) => () => void
+}
+
+/** Narrow alpha event face kept local while the npm release still ships legacy declarations. */
+interface ScopedQuestionContext {
+  on(
+    event: 'user-questions/request',
+    listener: (
+      request: AskUserQuestionRequest,
+      next: () => Promise<AskUserQuestionAnswer>,
+    ) => Promise<AskUserQuestionAnswer>,
+  ): () => void
+}
+
+/** Execute a command across the pre-attachment and attachment-aware DSH seams. */
+function executeCommand(
+  commands: { execute: Function },
+  agent: Agent,
+  line: string,
+  signal: AbortSignal,
+): Promise<CommandExecution | undefined> {
+  const execute = commands.execute as (...args: unknown[]) => Promise<CommandExecution | undefined>
+  // 0.1.0-rc.8/0.1.2-alpha.1 inserted the image batch before the signal.
+  // The TUI has no image composer, so the new seam always receives an empty batch.
+  return Reflect.apply(
+    execute,
+    commands,
+    execute.length >= 4 ? [agent, line, [], signal] : [agent, line, signal],
+  )
+}
+
 /** A named main-pane view. */
 export type TuiView =
   | 'conversation'
@@ -91,6 +126,10 @@ export type TuiView =
 interface SessionState {
   session: Session | undefined
   agent?: Agent
+  /** One create/resume transaction shared by every concurrent opener for this id. */
+  opening?: Promise<Agent | undefined>
+  /** Subagent routing owns this identity; the TUI may observe but never adopt it. */
+  subagentOwned: boolean
   /** Incremental transcript fold; keeps streaming chunks O(1). */
   fold: TranscriptFold
   transcript: TranscriptBlock[]
@@ -191,6 +230,22 @@ function modelLabel(selection: { provider: string; model: string; reasoningEffor
   if (selection === undefined) return undefined
   const base = `${selection.provider}/${selection.model}`
   return selection.reasoningEffort === undefined ? base : `${base} · ${selection.reasoningEffort}`
+}
+
+/** Restore only the route and user-owned effort from the latest durable request. */
+function persistedModelSelection(session: Session): ModelSelection | undefined {
+  const header = session.requestHeader()
+  if (header === undefined) return undefined
+  const { config } = header
+  return {
+    provider: config.provider,
+    model: config.model,
+    // Adapter defaults are not a durable user choice. Replaying one as an
+    // explicit override would freeze a provider default that may have changed.
+    ...config.reasoningEffort === undefined || header.adapterDefaults?.reasoningEffort === true
+      ? {}
+      : { reasoningEffort: config.reasoningEffort },
+  }
 }
 
 /** Compact token counts: `1.2k` for thousands, else the plain integer. */
@@ -395,7 +450,7 @@ export class TuiApp {
   private model: string | undefined
   private plan = false
   private permission: string | undefined
-  private readonly expandedTools = new Set<CallId>()
+  private readonly expandedTools = new Set<ToolCallKey>()
   private goal: GoalView | undefined
   private running = false
   private jobs: JobSnapshot[] = []
@@ -425,6 +480,9 @@ export class TuiApp {
    */
   private notice: string | undefined
   private disposeJobsChanged: (() => void) | undefined
+  private disposeQuestionAnswerer: (() => void) | undefined
+  /** Settle and close the one pending question popup, including on abort/dispose. */
+  private cancelQuestionPopup: (() => void) | undefined
   private disposed = false
   private readonly selections = new WeakMap<Agent, ModelSelectionRef>()
   private readonly resizeListener = (): void => { this.repaint() }
@@ -478,7 +536,7 @@ export class TuiApp {
     this.ctx.on('session/disposed', (session) => { this.removeSession(session) })
     this.ctx.on('agent/status', ({ agent, status }) => {
       const state = this.sessions.get(agent.id)
-      if (state !== undefined) {
+      if (state?.agent === agent) {
         state.running = status === 'running'
         this.refreshRunning()
         this.scheduleRepaint()
@@ -489,7 +547,7 @@ export class TuiApp {
     this.refreshPermission()
     this.refreshLocale() // apply the stored interface language
     this.installApprovalAnswerer()
-    this.installQuestionProvider()
+    this.installQuestionAnswerer()
     // Keep the jobs pane live without repainting anything else.
     this.disposeJobsChanged = this.ctx.get('jobs')?.onJobsChanged(() => { this.refreshJobs() })
   }
@@ -502,6 +560,8 @@ export class TuiApp {
     this.clearExitArmTimer()
     if (this.repaintTimer !== undefined) clearTimeout(this.repaintTimer)
     this.disposeJobsChanged?.()
+    this.cancelQuestionPopup?.()
+    this.disposeQuestionAnswerer?.()
     this.io.stdout.off?.('resize', this.resizeListener)
     this.screen.stop()
   }
@@ -550,7 +610,9 @@ export class TuiApp {
 
   private upsertSession(session: Session): void {
     const state = this.ensureState(session.id)
+    if (state.agent?.session !== session) state.agent = undefined
     state.session = session
+    state.subagentOwned = session.header.origin === 'subagent'
     state.fold = new TranscriptFold()
     state.usage = { ...ZERO_USAGE }
     state.usageStep = undefined
@@ -571,6 +633,8 @@ export class TuiApp {
   }
 
   private removeSession(session: Session): void {
+    const state = this.sessions.get(session.id)
+    if (state?.session !== session) return
     this.sessions.delete(session.id)
     if (this.current === session.id) {
       this.current = this.orderFirst()
@@ -582,8 +646,7 @@ export class TuiApp {
 
   private onSessionEvent(session: Session, event: SessionEvent): void {
     const state = this.sessions.get(session.id)
-    if (state === undefined) return
-    state.session = session
+    if (state?.session !== session) return
     state.fold.apply(event) // O(1): streaming chunks never rescan the log
     state.transcript = state.fold.blocks
     if (event.type === 'turn/start') {
@@ -618,6 +681,7 @@ export class TuiApp {
       const fold = new TranscriptFold()
       state = {
         session: undefined,
+        subagentOwned: false,
         fold,
         transcript: fold.blocks,
         running: false,
@@ -653,15 +717,22 @@ export class TuiApp {
 
   /** List live + persisted sessions and track them; only `--resume` selects one. */
   async refreshSessions(): Promise<void> {
-    const live = this.ctx.sessions.list().map((session) => {
+    const liveSessions = this.ctx.sessions.list()
+    const live = liveSessions.map((session) => {
       const state = this.sessions.get(session.id)
       return summarizeLive(session, state?.running ?? false)
     })
     const persistence = this.ctx.get('sessionPersistence')
     const cold = persistence === undefined ? [] : await persistence.list()
+    const subagentOwnership = new Map<SessionId, boolean>()
+    for (const header of cold) subagentOwnership.set(header.id, header.origin === 'subagent')
+    for (const session of liveSessions) {
+      subagentOwnership.set(session.id, session.header.origin === 'subagent')
+    }
     const merged = mergeSummaries(live, cold)
     for (const row of merged) {
       const state = this.ensureState(row.id)
+      state.subagentOwned = subagentOwnership.get(row.id) ?? false
       if (state.session === undefined) {
         const live = this.ctx.sessions.get(row.id)
         if (live !== undefined) {
@@ -687,7 +758,8 @@ export class TuiApp {
     }
     // The app starts empty: only an explicit `--resume` opens a session.
     if (this.current === undefined && this.startup.resume !== undefined) {
-      this.ensureCurrent(this.startup.resume)
+      const state = this.ensureState(this.startup.resume)
+      if (!this.refuseSubagentOwnership(this.startup.resume, state)) this.ensureCurrent(this.startup.resume)
     }
     this.repaint()
   }
@@ -700,33 +772,66 @@ export class TuiApp {
    */
   async currentAgent(): Promise<Agent | undefined> {
     if (this.current === undefined) return undefined
-    const state = this.ensureState(this.current)
+    // Capture the identity before any persistence await. A rapid session switch
+    // must never resume/create the newer id and attach that agent to this older
+    // state object.
+    const id = this.current
+    const state = this.ensureState(id)
+    if (this.refuseSubagentOwnership(id, state)) {
+      return undefined
+    }
     if (state.agent !== undefined) {
       this.syncAgentRunning(state)
       return state.agent
     }
-    const live = this.ctx.agents.get(this.current)
+    const live = this.ctx.agents.get(id)
     if (live !== undefined) {
+      if (this.refuseSubagentOwnership(id, state, live)) return undefined
       state.agent = live
       this.syncAgentRunning(state)
       return live
     }
+    if (state.opening !== undefined) return state.opening
+    const opening = this.openAgent(id, state)
+    state.opening = opening
+    try {
+      return await opening
+    } finally {
+      if (state.opening === opening) state.opening = undefined
+    }
+  }
+
+  /** Create or resume one exact session identity after callers are deduplicated. */
+  private async openAgent(id: SessionId, state: SessionState): Promise<Agent | undefined> {
     const persistence = this.ctx.get('sessionPersistence')
     const headers = persistence === undefined ? [] : await persistence.list()
-    const stored = headers.find(header => header.id === this.current)
+    const stored = headers.find(header => header.id === id)
+    if (stored?.origin === 'subagent') state.subagentOwned = true
+    // The identity can become live or be revealed as a persisted child while
+    // the persistence listing is pending. Recheck before either factory call.
+    const appeared = this.ctx.agents.get(id)
+    if (this.refuseSubagentOwnership(id, state, appeared)) return undefined
+    if (appeared !== undefined) {
+      state.agent = appeared
+      if (state.session !== appeared.session) this.attachResumedSession(state, appeared.session)
+      this.syncAgentRunning(state)
+      return appeared
+    }
     try {
       if (stored !== undefined) {
         const handle = await this.ctx.agents.resume({
-          resumeSessionId: this.current,
-          agentOptions: this.agentOptions(),
+          resumeSessionId: id,
+          agentOptions: this.agentOptions(false),
           setup: (agentCtx) => { this.installSelection(agentCtx) },
         })
+        if (this.refuseSubagentOwnership(id, state, handle.agent)) return undefined
         state.agent = handle.agent
         // A resumed agent is constructed idle and emits no `agent/status`
         // transition, so the running flag would otherwise stick to the
         // interrupted turn's `turn/start`. Sync from the live agent directly.
         this.attachResumedSession(state, handle.agent.session)
         this.syncAgentRunning(state)
+        if (this.current === id) this.refreshModel()
         state.resumedOpenTurn = hasOpenTurn(state.session)
         if (state.resumedOpenTurn) {
           this.pushNotice(t('status.resumedOpenTurn'))
@@ -737,18 +842,60 @@ export class TuiApp {
         return handle.agent
       }
       const handle = await this.ctx.agents.create({
-        sessionId: this.current,
-        agentOptions: this.agentOptions(),
+        sessionId: id,
+        agentOptions: this.agentOptions(true),
         meta: { cwd: process.cwd() },
         setup: (agentCtx) => { this.installSelection(agentCtx) },
       })
+      if (this.refuseSubagentOwnership(id, state, handle.agent)) return undefined
       state.agent = handle.agent
+      if (this.startup.plan) this.ctx.get('planMode')?.set(handle.agent, true)
       this.syncAgentRunning(state)
+      this.refreshPlan()
       return handle.agent
     } catch (error) {
-      this.ctx.logger.warn(`dsh-tui: could not open session ${String(this.current)}: ${String(error)}`)
+      // A creator outside this TUI may have won the same identity while the
+      // persistence lookup was pending. Adopt that exact live agent instead of
+      // dropping the caller's message after the losing factory call rejects.
+      const raced = this.ctx.agents.get(id)
+      if (raced !== undefined) {
+        if (this.refuseSubagentOwnership(id, state, raced)) return undefined
+        state.agent = raced
+        if (state.session !== raced.session) this.attachResumedSession(state, raced.session)
+        this.syncAgentRunning(state)
+        return raced
+      }
+      this.ctx.logger.warn(`dsh-tui: could not open session ${String(id)}: ${String(error)}`)
       return undefined
     }
+  }
+
+  /** Match the Host's generic-session guard for live and persisted subagent children. */
+  private isSubagentOwned(
+    id: SessionId,
+    state = this.ensureState(id),
+    agent = this.ctx.agents.get(id),
+  ): boolean {
+    if (state.subagentOwned) return true
+    if (agent === undefined) return false
+    if (agent.session.header.origin === 'subagent') return true
+    const parentId = agent.session.header.parentSession
+    if (parentId === undefined) return false
+    const parent = this.ctx.agents.get(parentId)
+    return parent !== undefined && this.ctx.agents.isOwnedBy(id, parent)
+  }
+
+  /** Fail closed when an identity belongs to subagent routing, including race winners. */
+  private refuseSubagentOwnership(
+    id: SessionId,
+    state = this.ensureState(id),
+    agent = this.ctx.agents.get(id),
+  ): boolean {
+    if (!this.isSubagentOwned(id, state, agent)) return false
+    state.subagentOwned = true
+    state.agent = undefined
+    this.pushNotice(t('session.subagentReadOnly', { id }))
+    return true
   }
 
   /** Mirror the live agent's `status` into the session state's running flag. */
@@ -823,7 +970,7 @@ export class TuiApp {
     }
     const controller = new AbortController()
     try {
-      const execution = await commands.execute(agent, '/compact', controller.signal)
+      const execution = await executeCommand(commands, agent, '/compact', controller.signal)
       if (execution === undefined) {
         this.pushNotice(t('compact.unavailable'))
         return
@@ -837,17 +984,30 @@ export class TuiApp {
     }
   }
 
-  /** The current default model selection. */
-  private agentOptions(): { provider?: string; model?: string } {
+  /** Resolve a complete route; command-line overrides apply only to fresh sessions. */
+  private agentOptions(fresh: boolean): AgentOptions {
     const selection = this.ctx.agentDefaultModel.currentSelection()
-    return { provider: selection.provider, model: selection.model }
+    if (!fresh || this.startup.model === undefined) return { ...selection }
+    const slash = this.startup.model.indexOf('/')
+    // An effort belongs to one provider/model route. Carrying the stored
+    // route's effort across a command-line route override can make an otherwise
+    // valid custom provider reject creation before its own defaults resolve.
+    const { reasoningEffort: _storedRouteEffort, ...routeIndependent } = selection
+    return {
+      ...routeIndependent,
+      provider: this.startup.model.slice(0, slash),
+      model: this.startup.model.slice(slash + 1),
+    }
   }
 
   /** Install a live per-session model selection ref in the agent's scope. */
   private installSelection(agentCtx: Context): void {
     const agent = agentCtx.agent
     if (agent === undefined) return
-    const ref: ModelSelectionRef = { current: undefined, assembled: undefined }
+    const ref: ModelSelectionRef = {
+      current: persistedModelSelection(agent.session),
+      assembled: undefined,
+    }
     installModelSelection(agentCtx, ref)
     this.selections.set(agent, ref)
   }
@@ -876,29 +1036,61 @@ export class TuiApp {
     })
   }
 
-  /** Answer user questions through a popup. */
-  private installQuestionProvider(): void {
+  /** Answer user questions through a popup on the current scoped seam. */
+  private installQuestionAnswerer(): void {
     const userQuestions = this.ctx.get('userQuestions')
     if (userQuestions === undefined) return
-    userQuestions.registerProvider({
-      ask: request => new Promise((resolve) => {
-        if (request.signal?.aborted === true) {
-          resolve({ answers: [] })
-          return
-        }
-        this.popup = {
-          kind: 'question',
-          questions: request.questions,
-          cursor: 0,
-          resolve: (answers) => {
-            this.popup = undefined
-            resolve({ answers })
-            this.repaint()
-          },
-        }
+    const ask = (request: AskUserQuestionRequest): Promise<AskUserQuestionAnswer> => new Promise((resolve, reject) => {
+      let settled = false
+      let abort: () => void
+      let dispose: () => void
+      const cleanup = (): void => {
+        request.signal?.removeEventListener('abort', abort)
+        if (this.popup === popup) this.popup = undefined
+        if (this.cancelQuestionPopup === dispose) this.cancelQuestionPopup = undefined
+      }
+      const finish = (answers: { id: string; selected: string[] }[]): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve({ answers })
         this.repaint()
-      }),
+      }
+      const fail = (reason: unknown): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(reason)
+        this.repaint()
+      }
+      const popup: QuestionPopup = {
+        kind: 'question',
+        questions: request.questions,
+        cursor: 0,
+        resolve: finish,
+      }
+      abort = () => {
+        fail(request.signal?.reason ?? new DOMException('This operation was aborted', 'AbortError'))
+      }
+      dispose = () => {
+        fail(new DOMException('The terminal UI was disposed', 'AbortError'))
+      }
+      this.popup = popup
+      this.cancelQuestionPopup = dispose
+      request.signal?.addEventListener('abort', abort, { once: true })
+      // Close the race between the initial check and listener registration.
+      if (request.signal?.aborted === true) abort()
+      this.repaint()
     })
+    const legacy = userQuestions as unknown as LegacyUserQuestionService
+    if (legacy.registerProvider !== undefined) {
+      this.disposeQuestionAnswerer = legacy.registerProvider({ ask })
+      return
+    }
+    this.disposeQuestionAnswerer = (this.ctx as unknown as ScopedQuestionContext).on(
+      'user-questions/request',
+      (request, next) => this.disposed || this.popup !== undefined ? next() : ask(request),
+    )
   }
 
   // ---- commands, models, plan, goals, jobs, subagents, settings, skills -----
@@ -931,7 +1123,7 @@ export class TuiApp {
       if (commands === undefined) return
       const controller = new AbortController()
       try {
-        const execution = await commands.execute(agent, line, controller.signal)
+        const execution = await executeCommand(commands, agent, line, controller.signal)
         if (execution === undefined) this.pushNotice(t('command.unknown', { line }))
       } catch (error: unknown) {
         this.pushNotice(t('command.failed', { error: String(error) }))
@@ -1003,9 +1195,15 @@ export class TuiApp {
 
   /** Cancel the current session's running turn. */
   cancel(): void {
+    this.cancelCurrent(true)
+  }
+
+  /** Cancel an active turn, optionally retaining work queued behind it. */
+  private cancelCurrent(keepInbox: boolean): void {
     /* v8 ignore next -- a running turn implies a current session: refreshRunning clears the flag whenever the current session changes */
     const agent = this.current === undefined ? undefined : this.ctx.agents.get(this.current)
-    agent?.cancel({ kind: 'user' })
+    if (keepInbox) agent?.cancel({ kind: 'user' }, { keepInbox: true })
+    else agent?.cancel({ kind: 'user' })
   }
 
   /** Toggle the full details of the most recent tool card (Ctrl+O). */
@@ -1122,18 +1320,14 @@ export class TuiApp {
 
   /** Create a new blank session and switch to it. */
   newSession(): void {
-    const session = this.ctx.sessions.create()
-    this.upsertSession(session)
-    this.ensureCurrent(session.id)
-    void this.refreshSessions()
-    this.repaint()
+    void this.newSessionWithAgent()
   }
 
   /** Create a new blank session and eagerly attach its agent. */
   async newSessionWithAgent(): Promise<void> {
     // Mint the id ourselves: agents.create() prepares the session through the
     // agent-loop factory, so a pre-created store session would collide.
-    const id = brandSessionId(`session-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`)
+    const id = brandSessionId(`session-${randomUUID()}`)
     this.ensureState(id)
     this.current = id
     this.scroll = 0
@@ -1144,12 +1338,16 @@ export class TuiApp {
   }
 
   /** Open an existing session from the sessions view (resume or attach). */
-  private async selectSession(id: SessionId): Promise<void> {
-    this.ensureState(id)
+  private async selectSession(id: SessionId): Promise<boolean> {
+    const state = this.ensureState(id)
+    if (this.refuseSubagentOwnership(id, state)) {
+      return false
+    }
     this.ensureCurrent(id)
     await this.currentAgent()
     void this.refreshSessions()
     this.repaint()
+    return true
   }
 
   /**
@@ -1260,10 +1458,17 @@ export class TuiApp {
     }
     const providers = llm.listProviders()
     const modelsByProvider = new Map<string, { id: string; name: string }[]>()
+    let failures = 0
     for (const provider of providers) {
-      modelsByProvider.set(provider.id, await llm.listModels(provider.id))
+      try {
+        modelsByProvider.set(provider.id, await llm.listModels(provider.id))
+      } catch (error: unknown) {
+        failures += 1
+        this.ctx.logger.warn(`dsh-tui: could not list models for provider ${provider.id}: ${String(error)}`)
+      }
     }
     this.modelGroups = buildModelGroups(providers, modelsByProvider)
+    if (failures > 0) this.pushNotice(t('model.catalogPartial', { count: String(failures) }))
   }
 
   // ---- key dispatch ---------------------------------------------------------
@@ -1328,10 +1533,13 @@ export class TuiApp {
     } else if (key.kind === 'enter') {
       const session = sessions[this.sessionCursor]
       if (session !== undefined) {
-        this.view = 'conversation'
-        this.sessionCursor = 0
-        this.sessionFilter = ''
-        void this.selectSession(session.id)
+        void this.selectSession(session.id).then((opened) => {
+          if (!opened) return
+          this.view = 'conversation'
+          this.sessionCursor = 0
+          this.sessionFilter = ''
+          this.repaint()
+        })
       }
     } else if (key.kind === 'escape') {
       if (this.sessionFilter !== '') {
@@ -1412,7 +1620,7 @@ export class TuiApp {
     })
   }
 
-  /** Subagents view: cursor navigation and opening a child's session. */
+  /** Subagents view: cursor navigation; child sessions remain observation-only. */
   private dispatchSubagents(key: TuiKey): void {
     if (key.kind === 'up') {
       this.subagentCursor = Math.max(0, this.subagentCursor - 1)
@@ -1423,9 +1631,7 @@ export class TuiApp {
     } else if (key.kind === 'enter') {
       const entry = this.subagents[this.subagentCursor]
       if (entry?.kind === 'child') {
-        this.view = 'conversation'
-        void this.selectSession(entry.id)
-        this.repaint()
+        this.pushNotice(t('session.subagentReadOnly', { id: entry.id }))
         return
       }
     } else if (key.kind === 'escape') {
@@ -2005,7 +2211,7 @@ export class TuiApp {
   private requestExit(): void {
     const sessionId = this.current
     if (this.running) {
-      this.cancel()
+      this.cancelCurrent(false)
       /* v8 ignore next -- a running turn implies a current session: refreshRunning clears the flag whenever the current session changes */
       const agent = sessionId === undefined ? undefined : this.ctx.agents.get(sessionId)
       /* v8 ignore next 2 -- a live session that reports turns always has a registered agent */
@@ -2205,7 +2411,7 @@ export class TuiApp {
       return
     }
     if (key.kind === 'ctrl' && key.name === 'q') {
-      this.onQuit(this.current)
+      this.requestExit()
       return
     }
     if (key.kind === 'escape') {

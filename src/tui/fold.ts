@@ -5,9 +5,12 @@
  * identically; the app refolds on every `session/event` append.
  */
 
-import type { SessionEvent, TodoItem } from '@deepseek-ai/dsh-session'
-import type { CallId } from '@deepseek-ai/dsh-llm'
+import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
 import type { FrameRow } from './screen.ts'
+
+/** Tool-call identity as owned by the session event vocabulary. */
+export type ToolCallKey = Extract<SessionEvent, { type: 'tool/call' }>['data']['callId']
 
 /** One display block in the transcript. */
 export type TranscriptBlock =
@@ -15,7 +18,7 @@ export type TranscriptBlock =
   | { kind: 'assistant'; text: string; streaming: boolean }
   | {
     kind: 'tool'
-    callId: CallId
+    callId: ToolCallKey
     name: string
     args: string
     status: 'running' | 'done'
@@ -132,7 +135,7 @@ function isStreaming(events: readonly SessionEvent[], end: number): boolean {
  * @param event - the result event to fold.
  */
 function settleToolResult(
-  toolCalls: ReadonlyMap<CallId, Extract<TranscriptBlock, { kind: 'tool' }>>,
+  toolCalls: ReadonlyMap<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>,
   event: Extract<SessionEvent, { type: 'tool/result' }>,
 ): void {
   const block = toolCalls.get(event.data.message.source.callId)
@@ -152,7 +155,7 @@ export function foldTranscript(events: readonly SessionEvent[]): TranscriptBlock
   const blocks: TranscriptBlock[] = []
   const push = (block: TranscriptBlock): void => { blocks.push(block) }
   let assistant: Extract<TranscriptBlock, { kind: 'assistant' }> | undefined
-  const toolCalls = new Map<CallId, Extract<TranscriptBlock, { kind: 'tool' }>>()
+  const toolCalls = new Map<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>()
 
   const closeAssistant = (): void => {
     if (assistant === undefined) return
@@ -256,7 +259,7 @@ export class TranscriptFold {
   /** The folded display blocks, mutated in place as events arrive. */
   readonly blocks: TranscriptBlock[] = []
   private assistant: Extract<TranscriptBlock, { kind: 'assistant' }> | undefined
-  private readonly toolCalls = new Map<CallId, Extract<TranscriptBlock, { kind: 'tool' }>>()
+  private readonly toolCalls = new Map<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>()
   private turnOpen = false
 
   private closeAssistant(): void {
