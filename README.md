@@ -9,6 +9,19 @@ It is a standard Cordis **bundle plugin** (`cordis.patch.yml` + `tui-runner`/`tu
 - Node `^22.19` or `>=24`
 - The official [DeepSeek Harness CLI](https://www.npmjs.com/package/@deepseek-ai/dsh) installed, so the `dsh-base` bundle and the cmdline/exit services exist.
 
+The current compatibility boundary was audited against both the published `0.1.1-rc.2` package
+line and the exact August 27 source release, `dsh-v0.1.2-alpha.1`
+(`cd5ef8148158c3a752a658978873241fdf8e2bbc`). Compatibility adapters retain the earlier
+`0.1.0-rc.6` command and user-question seams. The alpha is not available as a complete npm package
+set, so its check deliberately consumes a clean source checkout:
+
+```sh
+DSH_HARNESS_ROOT=/path/to/deepseek-harness npm run check:harness:alpha
+```
+
+The check fails closed if the checkout is dirty, the tag/commit does not match, or any imported
+Harness declaration has moved.
+
 ## Install & run
 
 This is a **bundle plugin** for the official `dsh` CLI: install it into a profile's bundle stack, then boot that profile. It layers the terminal runner over the official `dsh-base` bundle.

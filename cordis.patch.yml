@@ -24,7 +24,7 @@
 
 - id: tools
   config:
-    # Keep the same temporary process-wide Code Mode opt-in as the Web surface.
+    # Keep the same temporary process-wide PTC opt-in (native|ptc|both) as the Web surface.
     mode: !!js process.env.DSH_TOOLS_MODE
 
 # ── terminal-only host rows ─────────────────────────────────────────────────

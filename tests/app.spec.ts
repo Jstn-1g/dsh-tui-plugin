@@ -8,12 +8,13 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
+import AgentRegistry, { Inbox, agentEvents } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentHandle, AgentOptions, AgentSetup, CreateAgentOptions, ResumeAgentOptions } from '@deepseek-ai/dsh-agent'
 import AgentDefaultModelConfig from '@deepseek-ai/dsh-agent-default-model'
 import { createAssistantMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore from '@deepseek-ai/dsh-session'
-import type { Session, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionId, UserMessage } from '@deepseek-ai/dsh-session'
+import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import { TuiApp } from '../src/tui/app.ts'
 import { resetLocale, localeName } from '../src/tui/i18n.ts'
 import { MAX_MENTION_FILE_BYTES } from '../src/tui/mention.ts'
@@ -76,6 +77,8 @@ async function flushEsc(): Promise<void> {
 /** Scripted follow-up: append a user+assistant turn on every prompt. */
 interface Script {
   afterPrompt?(session: Session, message: UserMessage): Promise<void> | void
+  /** Create hook; defaults to the local scripted handle factory. */
+  create?(ownerCtx: Context, options: CreateAgentOptions): Promise<AgentHandle>
   /** Resume hook; defaults to rejecting so the app falls through to create. */
   resume?(ownerCtx: Context, options: ResumeAgentOptions): Promise<AgentHandle>
   /** Make the create factory reject, surfacing a creation failure. */
@@ -92,6 +95,7 @@ async function makeHandle(
   options: {
     agentOptions?: AgentOptions | undefined
     meta?: CreateAgentOptions['meta'] | undefined
+    seed?: readonly SessionEvent[] | undefined
     setup?: AgentSetup | undefined
     afterPrompt?: Script['afterPrompt'] | undefined
     bareSetup?: boolean | undefined
@@ -99,6 +103,7 @@ async function makeHandle(
 ): Promise<AgentHandle> {
   const session = ctx.sessions.create(sessionId, {
     ...options.meta === undefined ? {} : { meta: options.meta },
+    ...options.seed === undefined ? {} : { seed: options.seed },
   })
   let idle = Promise.resolve()
   const agent = {} as Agent
@@ -122,7 +127,9 @@ async function makeHandle(
     whenIdle: () => idle,
   } satisfies Partial<Agent>)
   await options.setup?.(options.bareSetup === true ? ownerCtx.extend({}) : agentCtx)
-  ctx.agents.register(agent)
+  // Register through the factory caller's context so runtime ownership in the
+  // real AgentRegistry matches root-vs-child creation semantics.
+  ownerCtx.agents.register(agent)
   return { agent, dispose: () => Promise.resolve() }
 }
 
@@ -142,9 +149,10 @@ async function bench(
   ctx.agents.setFactory({
     createAgent: (ownerCtx, options) => script.failCreate === true
       ? Promise.reject(new Error('factory failed'))
-      : makeHandle(ctx, ownerCtx, options.sessionId, {
+      : script.create?.(ownerCtx, options) ?? makeHandle(ctx, ownerCtx, options.sessionId, {
         agentOptions: options.agentOptions,
         meta: options.meta,
+        seed: options.seed,
         setup: options.setup,
         afterPrompt: (session, message) => script.afterPrompt?.(session, message),
         bareSetup: script.bareSetup,
@@ -228,7 +236,7 @@ describe('TuiApp', () => {
 
   it('steps Ctrl+C through cancel, clear, and exit', async () => {
     // Running turn: Ctrl+C cancels it.
-    let cancelled = 0
+    const cancellations: unknown[][] = []
     const { ctx, app } = await bench({
       afterPrompt: (session) => {
         session.append('turn/start', { turn: 1 })
@@ -239,13 +247,20 @@ describe('TuiApp', () => {
     await flush()
     const state = ctx.agents.list()[0]
     expect(state).toBeDefined()
-    ;(state as unknown as { cancel: () => void }).cancel = () => { cancelled += 1 }
+    ;(state as unknown as { cancel: (...args: unknown[]) => void }).cancel = (...args) => {
+      cancellations.push(args)
+      const options = args[1] as { keepInbox?: boolean } | undefined
+      if (options?.keepInbox !== true) state.inbox.clear()
+    }
     app.feed('go') // send a prompt so the scripted turn opens
     app.feed('\r')
     await flush()
+    await app.send('queued behind running turn')
+    expect(state.inbox.nextTurn).toHaveLength(2)
     expect(frameText(app)).toContain('running')
     app.feed('\x03')
-    expect(cancelled).toBe(1)
+    expect(cancellations).toEqual([[{ kind: 'user' }, { keepInbox: true }]])
+    expect(state.inbox.nextTurn).toHaveLength(2)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
@@ -1078,6 +1093,112 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
+  it('answers the alpha scoped user-question waterfall', async () => {
+    const { ctx, app } = await bench()
+    ctx.provide('userQuestions', {} as never)
+    app.start()
+    const answer = ctx.waterfall(
+      'user-questions/request' as never,
+      {
+        questions: [{ id: 'q1', question: 'pick', options: [{ label: 'A' }, { label: 'B' }] }],
+      } as never,
+      () => Promise.resolve({ answers: [] }) as never,
+    ) as Promise<{ answers: { id: string; selected: string[] }[] }>
+    await Promise.resolve()
+    app.feed('\x1b[B')
+    app.feed('\r')
+    await expect(answer).resolves.toEqual({ answers: [{ id: 'q1', selected: ['B'] }] })
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('rejects an aborted alpha question so the alpha service can normalize ASK_ABORTED', async () => {
+    const { ctx, app } = await bench()
+    const controller = new AbortController()
+    const abortReason = new DOMException('This operation was aborted', 'AbortError')
+    ctx.provide('userQuestions', {} as never)
+    app.start()
+    const answer = ctx.waterfall(
+      'user-questions/request' as never,
+      {
+        questions: [{ id: 'q1', question: 'abort me', options: [{ label: 'A' }] }],
+        signal: controller.signal,
+      } as never,
+      () => Promise.resolve({ answers: [] }) as never,
+    ) as Promise<{ answers: { id: string; selected: string[] }[] }>
+    await Promise.resolve()
+    expect(frameText(app)).toContain('abort me')
+    controller.abort(abortReason)
+    await expect(answer).rejects.toBe(abortReason)
+    expect(frameText(app)).not.toContain('abort me')
+
+    // The cancelled popup released the answerer for the next request.
+    const next = ctx.waterfall(
+      'user-questions/request' as never,
+      { questions: [{ id: 'q2', question: 'next question', options: [{ label: 'B' }] }] } as never,
+      () => Promise.resolve({ answers: [] }) as never,
+    ) as Promise<{ answers: { id: string; selected: string[] }[] }>
+    await Promise.resolve()
+    app.feed('\r')
+    await expect(next).resolves.toEqual({ answers: [{ id: 'q2', selected: ['B'] }] })
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('passes a second alpha user-question request to the next answerer while its popup is busy', async () => {
+    const { ctx, app } = await bench()
+    ctx.provide('userQuestions', {} as never)
+    app.start()
+    const first = ctx.waterfall(
+      'user-questions/request' as never,
+      { questions: [{ id: 'q1', question: 'first', options: [{ label: 'A' }] }] } as never,
+      () => Promise.resolve({ answers: [] }) as never,
+    ) as Promise<{ answers: { id: string; selected: string[] }[] }>
+    await Promise.resolve()
+    const fallback = { answers: [{ id: 'q2', selected: ['fallback'] }] }
+    const second = ctx.waterfall(
+      'user-questions/request' as never,
+      { questions: [{ id: 'q2', question: 'second' }] } as never,
+      () => Promise.resolve(fallback) as never,
+    ) as Promise<typeof fallback>
+    await expect(second).resolves.toEqual(fallback)
+    app.feed('\r')
+    await expect(first).resolves.toEqual({ answers: [{ id: 'q1', selected: ['A'] }] })
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('unregisters its alpha user-question answerer on dispose', async () => {
+    const { ctx, app } = await bench()
+    ctx.provide('userQuestions', {} as never)
+    app.start()
+    app.dispose()
+    const fallback = { answers: [{ id: 'q1', selected: ['fallback'] }] }
+    const answer = ctx.waterfall(
+      'user-questions/request' as never,
+      { questions: [{ id: 'q1', question: 'after dispose' }] } as never,
+      () => Promise.resolve(fallback) as never,
+    ) as Promise<typeof fallback>
+    await expect(answer).resolves.toEqual(fallback)
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('settles an outstanding alpha question when the TUI is disposed', async () => {
+    const { ctx, app } = await bench()
+    ctx.provide('userQuestions', {} as never)
+    app.start()
+    const answer = ctx.waterfall(
+      'user-questions/request' as never,
+      { questions: [{ id: 'q1', question: 'pending on dispose', options: [{ label: 'A' }] }] } as never,
+      () => Promise.resolve({ answers: [] }) as never,
+    ) as Promise<{ answers: { id: string; selected: string[] }[] }>
+    await Promise.resolve()
+    expect(frameText(app)).toContain('pending on dispose')
+    app.dispose()
+    await expect(answer).rejects.toMatchObject({ name: 'AbortError' })
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
   it('switches views with Tab and number keys', async () => {
     const { ctx, app } = await bench()
     app.start()
@@ -1346,6 +1467,37 @@ describe('TuiApp', () => {
     quitApp.feed('\x11') // Ctrl+Q
     expect(quit).toBe(1)
     quitApp.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('discards queued work when Ctrl+Q exits a running turn from another view', async () => {
+    let quit = 0
+    const cancellations: unknown[][] = []
+    const { ctx, app } = await bench({
+      afterPrompt: (session) => { session.append('turn/start', { turn: 1 }) },
+    }, { plan: false }, () => { quit += 1 })
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const agent = ctx.agents.list()[0]
+    if (agent === undefined) throw new Error('expected a created agent')
+    ;(agent as unknown as { cancel: (...args: unknown[]) => void }).cancel = (...args) => {
+      cancellations.push(args)
+      const options = args[1] as { keepInbox?: boolean } | undefined
+      if (options?.keepInbox !== true) agent.inbox.clear()
+    }
+    app.feed('go\r')
+    await flush()
+    await app.send('queued behind running turn')
+    expect(agent.inbox.nextTurn).toHaveLength(2)
+    expect(frameText(app)).toContain('running')
+    app.feed('\t')
+    app.feed('\x11')
+    await flush()
+    expect(cancellations).toEqual([[{ kind: 'user' }]])
+    expect(agent.inbox.nextTurn).toHaveLength(0)
+    expect(quit).toBe(1)
+    app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
 
@@ -1891,7 +2043,7 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
-  it('answers an aborted question request with empty answers', async () => {
+  it('rejects an already-aborted legacy question request', async () => {
     const { ctx, app } = await bench()
     const globals = globalThis as unknown as { __tuiQuestionProvider?: { ask: (request: never) => Promise<unknown> } }
     ctx.provide('userQuestions', {
@@ -1902,12 +2054,13 @@ describe('TuiApp', () => {
     app.start()
     const provider = globals.__tuiQuestionProvider
     expect(provider).toBeDefined()
+    const controller = new AbortController()
+    controller.abort()
     const answer = provider?.ask({
       questions: [{ id: 'q1', question: 'q' }],
-      signal: { aborted: true },
+      signal: controller.signal,
     } as never)
-    const resolved = await answer
-    expect(resolved).toEqual({ answers: [] })
+    await expect(answer).rejects.toBe(controller.signal.reason)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
@@ -2173,11 +2326,13 @@ describe('TuiApp', () => {
 
   it('sends a slash command directly', async () => {
     const executed: string[] = []
+    let commandSignal: AbortSignal | undefined
     const { ctx, app } = await bench()
     ctx.provide('commands', {
       list: () => [],
-      execute: async (_agent: never, line: string) => {
+      execute: async (_agent: never, line: string, signal: AbortSignal) => {
         executed.push(line)
+        commandSignal = signal
         return { commandId: 'x', result: { kind: 'success', text: 'ok' } }
       },
     } as never)
@@ -2186,6 +2341,298 @@ describe('TuiApp', () => {
     await flush()
     await app.send('/compact')
     expect(executed).toEqual(['/compact'])
+    expect(commandSignal).toBeInstanceOf(AbortSignal)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('keeps healthy custom providers selectable when another provider fails to list models', async () => {
+    const { ctx, app } = await bench()
+    ctx.provide('llm', {
+      listProviders: () => [{ id: 'broken', name: 'Broken' }, { id: 'custom', name: 'Custom' }],
+      listModels: async (provider: string) => {
+        if (provider === 'broken') throw new Error('provider unavailable')
+        return [{ id: 'healthy', name: 'Healthy' }]
+      },
+    } as never)
+    app.start()
+    app.feed('\x18')
+    await flush()
+    expect(frameText(app)).toContain('custom/healthy')
+    app.feed('\x1b')
+    await flushEsc()
+    expect(frameText(app)).toContain('1 model provider(s) could not be listed')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('applies startup model and plan choices without leaking another route\'s reasoning effort', async () => {
+    const planCalls: { id: string; active: boolean }[] = []
+    const { ctx, app } = await bench({}, { model: 'custom/vision', plan: true })
+    ;(ctx.agentDefaultModel as unknown as { currentSelection: () => AgentOptions }).currentSelection = () => ({
+      provider: 'default', model: 'base', reasoningEffort: 'high' as never,
+    })
+    ctx.provide('planMode', {
+      get: (agent: Agent) => ({ active: planCalls.some(call => call.id === agent.id && call.active) }),
+      set: (agent: Agent, active: boolean) => {
+        planCalls.push({ id: agent.id, active })
+        return 'committed' as const
+      },
+    } as never)
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const first = ctx.agents.list()[0]
+    if (first === undefined) throw new Error('expected a created agent')
+    expect(first.options).toEqual({ provider: 'custom', model: 'vision' })
+    expect(planCalls).toEqual([{ id: first.id, active: true }])
+    await app.newSessionWithAgent()
+    const second = ctx.agents.list().find(agent => agent.id !== first.id)
+    if (second === undefined) throw new Error('expected a second created agent')
+    expect(second.options).toEqual({ provider: 'custom', model: 'vision' })
+    expect(planCalls).toEqual([
+      { id: first.id, active: true },
+      { id: second.id, active: true },
+    ])
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('preserves the default fallback route on resume instead of applying fresh-session flags', async () => {
+    let resumedOptions: AgentOptions | undefined
+    const planCalls: boolean[] = []
+    const id = 'cold-route' as SessionId
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumedOptions = options.agentOptions
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    }, { resume: id, model: 'override/new', plan: true })
+    ;(ctx.agentDefaultModel as unknown as { currentSelection: () => AgentOptions }).currentSelection = () => ({
+      provider: 'stored-fallback', model: 'base', reasoningEffort: 'max' as never,
+    })
+    ctx.provide('planMode', {
+      get: () => ({ active: false }),
+      set: (_agent: Agent, active: boolean) => {
+        planCalls.push(active)
+        return 'committed' as const
+      },
+    } as never)
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    const agent = await app.currentAgent()
+    expect(agent?.id).toBe(id)
+    expect(resumedOptions).toEqual({ provider: 'stored-fallback', model: 'base', reasoningEffort: 'max' })
+    expect(planCalls).toEqual([])
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it.each([
+    {
+      label: 'explicit persisted effort',
+      adapterDefaults: undefined,
+      expected: { provider: 'persisted', model: 'old', reasoningEffort: 'high', temperature: 0.2 },
+    },
+    {
+      label: 'adapter-defaulted persisted effort',
+      adapterDefaults: { reasoningEffort: true },
+      expected: { provider: 'persisted', model: 'old', temperature: 0.2 },
+    },
+  ])('routes the first resumed request through its $label', async ({ adapterDefaults, expected }) => {
+    const id = `stored-route-${adapterDefaults === undefined ? 'explicit' : 'defaulted'}` as SessionId
+    const seed = [{
+      type: 'request/header',
+      seq: 0,
+      time: 1,
+      data: {
+        header: {
+          config: { provider: 'persisted', model: 'old', reasoningEffort: 'high' },
+          ...adapterDefaults === undefined ? {} : { adapterDefaults },
+        },
+        reason: 'initial',
+      },
+    }] as unknown as SessionEvent[]
+    const { ctx, app } = await bench({
+      resume: (ownerCtx, options) => makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+        agentOptions: options.agentOptions,
+        seed,
+        setup: options.setup,
+      }),
+    }, { resume: id, model: 'startup/ignored', plan: false })
+    await ctx.plugin(SystemPrompt)
+    ;(ctx.agentDefaultModel as unknown as { currentSelection: () => AgentOptions }).currentSelection = () => ({
+      provider: 'global', model: 'new', reasoningEffort: 'max' as never,
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: seed }),
+    } as never)
+    app.start()
+    await flush()
+    const agent = await app.currentAgent()
+    if (agent === undefined) throw new Error('expected the persisted session to resume')
+    expect(agent.options).toEqual({ provider: 'global', model: 'new', reasoningEffort: 'max' })
+
+    // Model selection snapshots at prompt assembly, then rewrites the exact
+    // request. This proves the stored route wins over the changed global one.
+    await agent.ctx.systemPrompt.assemble()
+    const routed = await agentEvents(agent.ctx, agent).waterfall(
+      'agent/request',
+      { turn: 1, step: 0, signal: new AbortController().signal },
+      () => Promise.resolve({
+        provider: 'global', model: 'new', reasoningEffort: 'max' as never, temperature: 0.2,
+      }),
+    )
+    expect(routed).toEqual(expected)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('keeps a persisted fork on its own child id when resuming it', async () => {
+    const resumed: string[] = []
+    const forkId = 'fork-child' as SessionId
+    const parentId = 'fork-parent' as SessionId
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumed.push(options.resumeSessionId)
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: forkId, createdAt: 1, version: 0, parentSession: parentId }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r')
+    await flush()
+    const agent = await app.currentAgent()
+    expect(agent?.id).toBe(forkId)
+    expect(agent?.session.id).toBe(forkId)
+    expect(resumed).toEqual([forkId])
+    expect(ctx.sessions.get(parentId)).toBeUndefined()
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('does not resume a persisted subagent child requested at startup', async () => {
+    const resumed: string[] = []
+    const childId = 'subagent-cold' as SessionId
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumed.push(options.resumeSessionId)
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    }, { resume: childId, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{
+        id: childId,
+        createdAt: 1,
+        version: 0,
+        parentSession: 'subagent-parent' as SessionId,
+        origin: 'subagent' as const,
+      }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    expect(await app.currentAgent()).toBeUndefined()
+    expect(resumed).toEqual([])
+    expect(frameText(app)).toContain('observation-only')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('rechecks a persisted session header that becomes a subagent child while opening', async () => {
+    const childId = 'subagent-cold-race' as SessionId
+    let listCalls = 0
+    let resumes = 0
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumes += 1
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    }, { resume: childId, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => {
+        listCalls += 1
+        return [{
+          id: childId,
+          createdAt: 1,
+          version: 0,
+          ...listCalls === 1 ? {} : { origin: 'subagent' as const },
+        }]
+      },
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    expect(listCalls).toBe(1)
+    await expect(app.currentAgent()).resolves.toBeUndefined()
+    expect(listCalls).toBe(2)
+    expect(resumes).toBe(0)
+    expect(frameText(app)).toContain('observation-only')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('ignores stale callbacks from different objects that reuse a live session id', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    const session = ctx.sessions.list()[0]
+    const agent = ctx.agents.list()[0]
+    if (session === undefined || agent === undefined) throw new Error('expected a live session and agent')
+    const staleSession = { id: session.id, header: session.header, events: [] } as unknown as Session
+    const staleAgent = { id: agent.id, session: staleSession } as unknown as Agent
+    ctx.emit('agent/status', { agent: staleAgent, status: 'running' })
+    ctx.emit('session/event', staleSession, {
+      type: 'turn/start', seq: 0, time: 1, data: { turn: 1 },
+    } as never)
+    ctx.emit('session/disposed', staleSession)
+    expect(frameText(app)).not.toContain('running')
+    expect(app.sessionsSnapshot().map(row => row.id)).toContain(session.id)
+    expect(await app.currentAgent()).toBe(agent)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('sends an empty image batch through the attachment-aware command seam', async () => {
+    let received: { line: string; images: readonly unknown[]; signal: AbortSignal } | undefined
+    const { ctx, app } = await bench()
+    ctx.provide('commands', {
+      list: () => [],
+      execute: async (_agent: never, line: string, images: readonly unknown[], signal: AbortSignal) => {
+        received = { line, images, signal }
+        return { commandId: 'x', result: { kind: 'success', text: 'ok' } }
+      },
+    } as never)
+    app.start()
+    app.feed('\x0e')
+    await flush()
+    await app.send('/compact')
+    expect(received?.line).toBe('/compact')
+    expect(received?.images).toEqual([])
+    expect(received?.signal).toBeInstanceOf(AbortSignal)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
@@ -2206,6 +2653,234 @@ describe('TuiApp', () => {
     const message = agent?.inbox.nextTurn[0]
     const text = message?.content.filter(block => block.type === 'text').map(block => (block as { text: string }).text).join('')
     expect(text).toBe('hello')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('deduplicates a Ctrl+N create racing the first message without dropping it', async () => {
+    const gate = Promise.withResolvers<void>()
+    let creates = 0
+    let createdId: SessionId | undefined
+    const { ctx, app } = await bench({
+      create: async (ownerCtx, options) => {
+        creates += 1
+        createdId = options.sessionId
+        await gate.promise
+        return makeHandle(ctx, ownerCtx, options.sessionId, {
+          agentOptions: options.agentOptions,
+          meta: options.meta,
+          seed: options.seed,
+          setup: options.setup,
+        })
+      },
+    })
+    app.start()
+    app.newSession() // key dispatch intentionally does not await this path
+    await flush()
+    const sending = app.send('delivered once')
+    await Promise.resolve()
+    expect(creates).toBe(1)
+    gate.resolve()
+    await sending
+    await flush()
+    expect(creates).toBe(1)
+    expect(ctx.sessions.list().map(session => session.id)).toEqual([createdId])
+    const messages = createdId === undefined ? [] : ctx.agents.get(createdId)?.inbox.nextTurn
+    expect(messages).toHaveLength(1)
+    expect(messages?.[0]?.content).toEqual([{ type: 'text', text: 'delivered once' }])
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('keeps rapid new-session identities isolated', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    await app.send('first')
+    await app.newSessionWithAgent()
+    await app.send('second')
+    await flush()
+    const ids = ctx.sessions.list().map(session => session.id)
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+    for (const id of ids) expect(id).toMatch(/^session-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
+    for (const id of ids) expect(ctx.agents.get(id)?.session.id).toBe(id)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('captures the selected id across a delayed persistence lookup', async () => {
+    const coldId = 'cold-race' as SessionId
+    const resumed: string[] = []
+    let listCalls = 0
+    let releaseList!: () => void
+    const delayed = new Promise<void>(resolve => { releaseList = resolve })
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumed.push(options.resumeSessionId)
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    })
+    ctx.provide('sessionPersistence', {
+      list: async () => {
+        listCalls += 1
+        if (listCalls === 2) await delayed
+        return [{ id: coldId, createdAt: 1, version: 0 }]
+      },
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    app.feed('\t')
+    app.feed('\r') // opening cold-race blocks on the second list call
+    await Promise.resolve()
+    expect(listCalls).toBe(2)
+    await app.newSessionWithAgent() // switch while cold-race is still opening
+    const fresh = await app.currentAgent()
+    if (fresh === undefined) throw new Error('expected the fresh session agent')
+    expect(fresh.id).not.toBe(coldId)
+    releaseList()
+    await flush()
+    expect(resumed).toEqual([coldId])
+    expect(ctx.agents.get(coldId)?.session.id).toBe(coldId)
+    expect((await app.currentAgent())?.id).toBe(fresh.id)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('does not adopt a subagent child that wins the same-id open race', async () => {
+    const childId = 'subagent-open-race' as SessionId
+    const parentId = 'subagent-open-parent' as SessionId
+    const gate = Promise.withResolvers<void>()
+    let listCalls = 0
+    let creates = 0
+    const { ctx, app } = await bench({
+      create: async (ownerCtx, options) => {
+        creates += 1
+        return makeHandle(ctx, ownerCtx, options.sessionId, {
+          agentOptions: options.agentOptions,
+          meta: options.meta,
+          seed: options.seed,
+          setup: options.setup,
+        })
+      },
+    }, { resume: childId, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => {
+        listCalls += 1
+        if (listCalls === 1) return [{ id: childId, createdAt: 1, version: 0 }]
+        await gate.promise
+        return []
+      },
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    const opening = app.currentAgent()
+    await Promise.resolve()
+    expect(listCalls).toBe(2)
+
+    const parent = await makeHandle(ctx, ctx, parentId, {
+      meta: { cwd: process.cwd() },
+    })
+    const child = await makeHandle(ctx, parent.agent.ctx, childId, {
+      meta: { cwd: process.cwd(), parentSession: parentId, origin: 'subagent' },
+    })
+    expect(ctx.agents.isOwnedBy(childId, parent.agent)).toBe(true)
+    gate.resolve()
+
+    await expect(opening).resolves.toBeUndefined()
+    expect(creates).toBe(0)
+    expect(ctx.agents.get(childId)).toBe(child.agent)
+    await expect(app.currentAgent()).resolves.toBeUndefined()
+    expect(frameText(app)).toContain('observation-only')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('does not adopt a runtime-owned child after a same-id factory loses the race', async () => {
+    const childId = 'catch-child' as SessionId
+    const parentId = 'catch-parent' as SessionId
+    let parent: AgentHandle | undefined
+    let child: AgentHandle | undefined
+    let resumes = 0
+    const { ctx, app } = await bench({
+      resume: async (_ownerCtx, options) => {
+        resumes += 1
+        if (parent === undefined) throw new Error('expected race parent')
+        child = await makeHandle(ctx, parent.agent.ctx, options.resumeSessionId, {
+          meta: { cwd: process.cwd(), parentSession: parentId, origin: 'subagent' },
+        })
+        throw new Error('external child won the identity')
+      },
+    }, { resume: childId, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id: childId, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    parent = await makeHandle(ctx, ctx, parentId, {
+      meta: { cwd: process.cwd() },
+    })
+    app.start()
+    await flush()
+
+    await expect(app.currentAgent()).resolves.toBeUndefined()
+    expect(resumes).toBe(1)
+    expect(child).toBeDefined()
+    expect(ctx.agents.isOwnedBy(childId, parent.agent)).toBe(true)
+    expect(ctx.agents.get(childId)).toBe(child?.agent)
+    expect(frameText(app)).toContain('observation-only')
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('deduplicates concurrent resume requests for the same persisted id', async () => {
+    const id = 'cold-deduplicated' as SessionId
+    const gate = Promise.withResolvers<void>()
+    let resumes = 0
+    const { ctx, app } = await bench({
+      resume: async (ownerCtx, options) => {
+        resumes += 1
+        await gate.promise
+        return makeHandle(ctx, ownerCtx, options.resumeSessionId, {
+          agentOptions: options.agentOptions,
+          setup: options.setup,
+        })
+      },
+    }, { resume: id, plan: false })
+    ctx.provide('sessionPersistence', {
+      list: async () => [{ id, createdAt: 1, version: 0 }],
+      load: async () => ({ meta: null, events: [] }),
+    } as never)
+    app.start()
+    await flush()
+    const first = app.currentAgent()
+    const second = app.currentAgent()
+    await Promise.resolve()
+    expect(resumes).toBe(1)
+    gate.resolve()
+    const [firstAgent, secondAgent] = await Promise.all([first, second])
+    expect(resumes).toBe(1)
+    expect(firstAgent).toBe(secondAgent)
+    expect(firstAgent?.id).toBe(id)
+    expect(firstAgent?.session.id).toBe(id)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('queues consecutive follow-up messages without overwriting either one', async () => {
+    const { ctx, app } = await bench()
+    app.start()
+    await app.send('first')
+    await app.send('second')
+    const agent = ctx.agents.list()[0]
+    const texts = agent?.inbox.nextTurn.map(message => message.content
+      .filter(block => block.type === 'text')
+      .map(block => (block as { text: string }).text)
+      .join(''))
+    expect(texts).toEqual(['first', 'second'])
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
@@ -3332,13 +4007,16 @@ describe('TuiApp', () => {
     // A question popup taller than the window is sliced to fit it.
     app.feed('\x1b')
     await flushEsc()
-    void globals.__tuiQuestionProvider?.ask({
+    const popupAnswer = globals.__tuiQuestionProvider?.ask({
       questions: [{ id: 'q1', question: 'pick', options: Array.from({ length: 12 }, (_, i) => ({ label: `option-${i}` })) }],
     } as never)
+    expect(popupAnswer).toBeDefined()
     const popupRows = app.frame().rows
     expect(popupRows).toHaveLength(8)
     expect(rowText(popupRows[popupRows.length - 1] ?? '')).toContain('❯')
+    const rejected = expect(popupAnswer).rejects.toMatchObject({ name: 'AbortError' })
     app.dispose()
+    await rejected
     disposers.push(() => ctx.fiber.dispose())
   })
 
@@ -3482,7 +4160,7 @@ describe('TuiApp', () => {
     disposers.push(() => ctx.fiber.dispose())
   })
 
-  it('opens a child session from the subagents view', async () => {
+  it('keeps child sessions observation-only in the subagents view', async () => {
     const { ctx, app } = await bench()
     ctx.provide('subagents', {
       listChildren: async () => [
@@ -3493,6 +4171,10 @@ describe('TuiApp', () => {
     app.start()
     app.feed('\x0e')
     await flush()
+    const parent = await app.currentAgent()
+    if (parent === undefined) throw new Error('expected a parent agent')
+    const sessionCount = ctx.sessions.list().length
+    const agentCount = ctx.agents.list().length
     app.feed('\t')
     app.feed('4')
     await flush()
@@ -3501,9 +4183,64 @@ describe('TuiApp', () => {
     app.feed('\r') // terminated entries are not openable
     expect(frameText(app)).toContain('r1 · terminated · completed')
     app.feed('\x1b[A')
-    app.feed('\r') // open child-1
+    app.feed('\r') // child sessions cannot be adopted by the root TUI
     await flush()
-    expect(frameText(app)).toContain('New session — type a message below')
+    expect(frameText(app)).toContain('child-1 · running · one-shot')
+    expect(frameText(app)).toContain('observation-only')
+    expect(ctx.sessions.list()).toHaveLength(sessionCount)
+    expect(ctx.agents.list()).toHaveLength(agentCount)
+    expect(await app.currentAgent()).toBe(parent)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('refuses to adopt a live subagent child from the sessions view', async () => {
+    const { ctx, app } = await bench()
+    const childId = 'subagent-live' as SessionId
+    ctx.sessions.create(childId, {
+      meta: {
+        cwd: process.cwd(),
+        parentSession: 'subagent-parent' as SessionId,
+        origin: 'subagent',
+      },
+    })
+    app.start()
+    await flush()
+    app.feed('\t')
+    expect(frameText(app)).toContain('New session')
+    app.feed('\r')
+    await flush()
+    expect(await app.currentAgent()).toBeUndefined()
+    expect(ctx.agents.list()).toHaveLength(0)
+    expect(frameText(app)).toContain('observation-only')
+    expect(frameText(app)).toContain(childId)
+    app.dispose()
+    disposers.push(() => ctx.fiber.dispose())
+  })
+
+  it('uses runtime ownership to keep an unlabelled child observation-only', async () => {
+    const childId = 'runtime-child' as SessionId
+    const parentId = 'runtime-parent' as SessionId
+    const { ctx, app } = await bench({}, { resume: childId, plan: false })
+    const parent = await ctx.agents.create({
+      sessionId: parentId,
+      agentOptions: {},
+      meta: { cwd: process.cwd() },
+    })
+    await parent.agent.ctx.agents.create({
+      sessionId: childId,
+      agentOptions: {},
+      // Deliberately omit origin: older/external child factories may preserve
+      // lineage without the durable coarse classification.
+      meta: { cwd: process.cwd(), parentSession: parentId },
+    })
+    expect(ctx.agents.isOwnedBy(childId, parent.agent)).toBe(true)
+    app.start()
+    await flush()
+    expect(await app.currentAgent()).toBeUndefined()
+    expect(frameText(app)).toContain('observation-only')
+    expect(ctx.agents.get(parentId)).toBe(parent.agent)
+    expect(ctx.agents.get(childId)?.session.id).toBe(childId)
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
   })
