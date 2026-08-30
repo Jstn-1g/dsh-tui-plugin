@@ -28,8 +28,8 @@ import * as yaml from 'js-yaml'
 import { entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import { boot } from '@deepseek-ai/dsh-app-boot'
 import { provideCmdline } from '@deepseek-ai/dsh-cmdline'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { Context } from '@deepseek-ai/cordis'
+import { TUI_LOCALE_NS } from '../src/tui/locale-settings.ts'
 
 /**
  * The bundle patch files exactly as the tui layer mounts them: the official
@@ -64,7 +64,7 @@ function importPatchTarget(specifier: string): string {
 }
 
 /** The namespace the palette's `/lang` command writes: the terminal surface owns it. */
-const TUI_NS = settingsNamespace('tui')
+const TUI_NS = TUI_LOCALE_NS
 
 /** Parse one bundle patch file through the Loader's own entry schema. */
 function loadBundlePatches(file: string): PatchOptions[] {

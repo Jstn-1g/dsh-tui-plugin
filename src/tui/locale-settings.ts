@@ -7,11 +7,11 @@
  */
 
 import z from '@deepseek-ai/schemastery'
-import { settingsNamespace } from '@deepseek-ai/dsh-settings'
+import type { SettingsNamespace } from '@deepseek-ai/dsh-settings'
 import type { TuiLocaleName } from './i18n.ts'
 
 /** The settings namespace the terminal surface owns. */
-export const TUI_LOCALE_NS = settingsNamespace('tui')
+export const TUI_LOCALE_NS = 'tui' as SettingsNamespace
 
 /** The namespace value: the active interface language. */
 export interface TuiLocaleSettings {

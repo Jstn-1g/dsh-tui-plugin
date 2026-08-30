@@ -9,11 +9,13 @@ It is a standard Cordis **bundle plugin** (`cordis.patch.yml` + `tui-runner`/`tu
 - Node `^22.19` or `>=24`
 - The official [DeepSeek Harness CLI](https://www.npmjs.com/package/@deepseek-ai/dsh) installed, so the `dsh-base` bundle and the cmdline/exit services exist.
 
-The current compatibility boundary was audited against both the published `0.1.1-rc.2` package
-line and the exact August 27 source release, `dsh-v0.1.2-alpha.1`
-(`cd5ef8148158c3a752a658978873241fdf8e2bbc`). Compatibility adapters retain the earlier
-`0.1.0-rc.6` command and user-question seams. The alpha is not available as a complete npm package
-set, so its check deliberately consumes a clean source checkout:
+Version `0.3.1` targets only the exact published DSH `0.1.2-alpha.2` cohort and
+its August 30 source release, `dsh-v0.1.2-alpha.2`
+(`0a53fb55bea101816fa226bb964ae2bed71c343b`). Keep TUI `0.3.0` for the older
+rc line. The permission-preset service intentionally changed its input from an
+event list to a live Session, so one TUI build cannot honestly claim both
+contracts without a version-aware public adapter. The exact-alpha check
+deliberately consumes a clean source checkout:
 
 ```sh
 DSH_HARNESS_ROOT=/path/to/deepseek-harness npm run check:harness:alpha
@@ -27,8 +29,8 @@ Harness declaration has moved.
 This is a **bundle plugin** for the official `dsh` CLI: install it into a profile's bundle stack, then boot that profile. It layers the terminal runner over the official `dsh-base` bundle.
 
 ```sh
-npm i -g @deepseek-ai/dsh
-npm i -g dsh-tui-plugin
+npm i -g @deepseek-ai/dsh@0.1.2-alpha.2
+npm i -g dsh-tui-plugin@0.3.1
 
 # one-time: create/use a profile and add this bundle to it
 dsh plugin --profile tui add dsh-tui-plugin
@@ -79,7 +81,11 @@ DSH_BASE_PATCH=/path/to/deepseek-harness/packages/bundle/base/cordis.patch.yml n
 
 ## Upgrading
 
-The bundle pins `@deepseek-ai/dsh-*` service APIs that are stable, but official releases occasionally adjust the base patch rows. When a new `@deepseek-ai/dsh` lands, bump the ranges and re-run the composition test against the new base.
+The bundle pins one exact `@deepseek-ai/dsh-*` cohort because service methods
+and base patch rows can change between prereleases. When a new DSH version
+lands, audit the source contracts, move the complete dependency graph together,
+and rerun the tracked-source and real-composition checks before widening or
+replacing the peer cohort.
 
 ## License
 

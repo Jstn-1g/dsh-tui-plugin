@@ -1393,7 +1393,7 @@ export class TuiApp {
     const session = state?.session
     this.permission = presets === undefined || session === undefined
       ? presets?.defaultPreset
-      : presets.current(session.events)
+      : presets.current(session)
     this.repaint()
   }
 
@@ -1404,7 +1404,7 @@ export class TuiApp {
     const session = state?.session
     if (presets === undefined || session === undefined) return
     const danger = presets.names.find(name => name === 'danger-full-access')
-    if (danger !== undefined && presets.current(session.events) !== danger) presets.set(session, danger)
+    if (danger !== undefined && presets.current(session) !== danger) presets.set(session, danger)
     this.refreshPermission()
   }
 
@@ -2551,7 +2551,7 @@ export class TuiApp {
     const session = state?.session
     // Before any session exists, the picker edits the default preset that
     // new sessions inherit.
-    const current = session === undefined ? presets.defaultPreset : presets.current(session.events)
+    const current = session === undefined ? presets.defaultPreset : presets.current(session)
     const popup = modePopup(presets.names, current, this.listPopupHeight())
     this.popup = {
       ...popup,

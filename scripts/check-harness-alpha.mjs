@@ -7,8 +7,8 @@ import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 
-const EXPECTED_TAG = 'dsh-v0.1.2-alpha.1'
-const EXPECTED_COMMIT = 'cd5ef8148158c3a752a658978873241fdf8e2bbc'
+const EXPECTED_TAG = 'dsh-v0.1.2-alpha.2'
+const EXPECTED_COMMIT = '0a53fb55bea101816fa226bb964ae2bed71c343b'
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 function tsPath(path) {
@@ -149,7 +149,7 @@ for (const fragment of [
 }
 const tuiPackage = JSON.parse(await readFile(join(projectRoot, 'package.json'), 'utf8'))
 const workerPeer = tuiPackage.peerDependencies?.['@deepseek-ai/dsh-code-runtime-worker-thread']
-if (typeof workerPeer !== 'string' || !workerPeer.includes('0.1.2-alpha.1')) {
+if (workerPeer !== '0.1.2-alpha.2') {
   fail('the TUI package does not declare the exact alpha worker-thread runtime as compatible')
 }
 

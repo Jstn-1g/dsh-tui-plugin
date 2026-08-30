@@ -3415,21 +3415,29 @@ describe('TuiApp', () => {
 
   it('opens the permission picker through /mode and applies a preset', async () => {
     const set: string[] = []
+    const currentArguments: unknown[] = []
     const { ctx, app } = await bench()
     ctx.provide('permissionPresets', {
       names: ['workspace-write', 'danger-full-access'],
       defaultPreset: 'workspace-write',
-      current: () => 'workspace-write',
+      current: (session: unknown) => {
+        currentArguments.push(session)
+        return 'workspace-write'
+      },
       set: (_session: never, name: string) => { set.push(name) },
     } as never)
     app.start()
     app.feed('\x0e') // create a session
     await flush()
+    const session = ctx.agents.list()[0]?.session
+    expect(session).toBeDefined()
     app.feed('/mode\r')
     expect(frameText(app)).toContain('Permission mode')
     expect(frameText(app)).toContain('workspace-write (current)')
     app.feed('\x1b[B') // down to danger-full-access
     app.feed('\r')
+    expect(currentArguments).not.toEqual([])
+    expect(currentArguments.every(argument => argument === session)).toBe(true)
     expect(set).toEqual(['danger-full-access'])
     expect(frameText(app)).toContain('Permission mode: danger-full-access')
     app.dispose()
@@ -3634,11 +3642,15 @@ describe('TuiApp', () => {
 
   it('always-allow switches the permission preset and approves', async () => {
     const set: string[] = []
+    const currentArguments: unknown[] = []
     const { ctx, app } = await bench()
     ctx.provide('permissionPresets', {
       names: ['workspace-write', 'danger-full-access'],
       defaultPreset: 'workspace-write',
-      current: () => 'workspace-write',
+      current: (session: unknown) => {
+        currentArguments.push(session)
+        return 'workspace-write'
+      },
       set: (_session: never, name: string) => { set.push(name) },
     } as never)
     app.start()
@@ -3651,6 +3663,8 @@ describe('TuiApp', () => {
     await Promise.resolve()
     app.feed('a') // always allow
     await expect(promise).resolves.toBe('allowed-once')
+    expect(currentArguments).not.toEqual([])
+    expect(currentArguments.every(argument => argument === agent?.session)).toBe(true)
     expect(set).toEqual(['danger-full-access'])
     app.dispose()
     disposers.push(() => ctx.fiber.dispose())
