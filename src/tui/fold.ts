@@ -12,6 +12,14 @@ import type { FrameRow } from './screen.ts'
 /** Tool-call identity as owned by the session event vocabulary. */
 export type ToolCallKey = Extract<SessionEvent, { type: 'tool/call' }>['data']['callId']
 
+/** Transcript-local tool identity; provider call ids need only be unique inside one step. */
+type ToolCallAddress = `${number}:${number}:${string}`
+
+/** Scope a provider-owned call id by the turn and step that emitted it. */
+function toolCallAddress(turn: number, step: number, callId: ToolCallKey): ToolCallAddress {
+  return `${turn}:${step}:${String(callId)}`
+}
+
 /** One display block in the transcript. */
 export type TranscriptBlock =
   | { kind: 'user'; text: string }
@@ -135,10 +143,14 @@ function isStreaming(events: readonly SessionEvent[], end: number): boolean {
  * @param event - the result event to fold.
  */
 function settleToolResult(
-  toolCalls: ReadonlyMap<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>,
+  toolCalls: ReadonlyMap<ToolCallAddress, Extract<TranscriptBlock, { kind: 'tool' }>>,
   event: Extract<SessionEvent, { type: 'tool/result' }>,
 ): void {
-  const block = toolCalls.get(event.data.message.source.callId)
+  const block = toolCalls.get(toolCallAddress(
+    event.data.turn,
+    event.data.step,
+    event.data.message.source.callId,
+  ))
   if (block !== undefined) {
     block.status = 'done'
     block.result = messageText(event.data.message.content)
@@ -155,7 +167,7 @@ export function foldTranscript(events: readonly SessionEvent[]): TranscriptBlock
   const blocks: TranscriptBlock[] = []
   const push = (block: TranscriptBlock): void => { blocks.push(block) }
   let assistant: Extract<TranscriptBlock, { kind: 'assistant' }> | undefined
-  const toolCalls = new Map<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>()
+  const toolCalls = new Map<ToolCallAddress, Extract<TranscriptBlock, { kind: 'tool' }>>()
 
   const closeAssistant = (): void => {
     if (assistant === undefined) return
@@ -203,7 +215,7 @@ export function foldTranscript(events: readonly SessionEvent[]): TranscriptBlock
           args: event.data.arguments,
           status: 'running',
         }
-        toolCalls.set(event.data.callId, block)
+        toolCalls.set(toolCallAddress(event.data.turn, event.data.step, event.data.callId), block)
         push(block)
         break
       }
@@ -259,7 +271,7 @@ export class TranscriptFold {
   /** The folded display blocks, mutated in place as events arrive. */
   readonly blocks: TranscriptBlock[] = []
   private assistant: Extract<TranscriptBlock, { kind: 'assistant' }> | undefined
-  private readonly toolCalls = new Map<ToolCallKey, Extract<TranscriptBlock, { kind: 'tool' }>>()
+  private readonly toolCalls = new Map<ToolCallAddress, Extract<TranscriptBlock, { kind: 'tool' }>>()
   private turnOpen = false
 
   private closeAssistant(): void {
@@ -324,7 +336,7 @@ export class TranscriptFold {
           args: event.data.arguments,
           status: 'running',
         }
-        this.toolCalls.set(event.data.callId, block)
+        this.toolCalls.set(toolCallAddress(event.data.turn, event.data.step, event.data.callId), block)
         this.blocks.push(block)
         break
       }

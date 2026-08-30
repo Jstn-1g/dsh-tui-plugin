@@ -35,18 +35,24 @@ function chunk(text: string): SessionEvent<'assistant/chunk'> {
   }
 }
 
-function toolCall(callId: string, name: string, args: string): SessionEvent<'tool/call'> {
+function toolCall(
+  callId: string,
+  name: string,
+  args: string,
+  turn = 1,
+  step = 1,
+): SessionEvent<'tool/call'> {
   return {
     type: 'tool/call', seq: 0, time: 1,
-    data: { turn: 1, step: 1, callId: callId as never, name, arguments: args },
+    data: { turn, step, callId: callId as never, name, arguments: args },
   }
 }
 
-function toolResult(callId: string, text: string): SessionEvent<'tool/result'> {
+function toolResult(callId: string, text: string, turn = 1, step = 1): SessionEvent<'tool/result'> {
   return {
     type: 'tool/result', seq: 0, time: 1,
     data: {
-      turn: 1, step: 1,
+      turn, step,
       message: createToolResultMessage({
         callId: callId as never,
         content: [{ type: 'text', text }],
@@ -114,6 +120,27 @@ describe('TranscriptFold', () => {
       } },
     ] as unknown as SessionEvent[]
     expect(foldAll(events)).toEqual(foldTranscript(events))
+  })
+
+  it('keeps repeated provider call ids isolated across steps', () => {
+    const events = [
+      toolCall('bash:0', 'bash', '{"cmd":"first"}', 1, 1),
+      toolCall('bash:0', 'bash', '{"cmd":"second"}', 1, 2),
+      toolResult('bash:0', 'first result', 1, 1),
+      toolResult('bash:0', 'second result', 1, 2),
+    ]
+    const expected = [
+      {
+        kind: 'tool', callId: 'bash:0', name: 'bash', args: '{"cmd":"first"}',
+        status: 'done', result: 'first result',
+      },
+      {
+        kind: 'tool', callId: 'bash:0', name: 'bash', args: '{"cmd":"second"}',
+        status: 'done', result: 'second result',
+      },
+    ]
+    expect(foldTranscript(events)).toEqual(expected)
+    expect(foldAll(events)).toEqual(expected)
   })
 
   it('grows an open assistant block in place', () => {
